@@ -127,6 +127,17 @@ impl AsPathSegment {
             }
         };
         let count = buf[1] as usize;
+        // RFC 4271 §4.3: "A segment length of zero is not permitted
+        // in an AS_SEQUENCE or AS_SET segment." Reject at parse so
+        // we never store and never propagate an invalid segment.
+        if count == 0 {
+            return Err(ParseError::Update {
+                code: ErrorCode::UpdateMessage,
+                subcode: UpdateMessageSubcode::MalformedAsPath as u8,
+                message: "AS_PATH segment length of zero is not permitted (RFC 4271 §4.3)".into(),
+                action: AttributeErrorAction::SessionReset,
+            });
+        }
         let need = 2 + 4 * count;
         if buf.len() < need {
             return Err(ParseError::Update {
@@ -241,8 +252,17 @@ impl PathAttribute {
         match self {
             PathAttribute::Origin(o) => vec![*o as u8],
             PathAttribute::AsPath(segments) => {
+                // Belt-and-suspenders: drop any zero-length segment
+                // before emitting. RFC 4271 §4.3 forbids them, and a
+                // peer receiving one (e.g. FRR) treats it as
+                // Malformed AS_PATH → session reset. The parser
+                // already rejects them on the way in; this guards
+                // against accidental internal construction.
                 let mut out = Vec::new();
                 for seg in segments {
+                    if seg.asns.is_empty() {
+                        continue;
+                    }
                     out.extend(seg.encode());
                 }
                 out
@@ -605,6 +625,58 @@ mod tests {
             asns: vec![64512, 64513, 4_200_000_000],
         }]);
         assert_eq!(roundtrip(&attr), attr);
+    }
+
+    #[test]
+    fn as_path_parse_rejects_zero_length_segment() {
+        // RFC 4271 §4.3: segment length of zero is not permitted.
+        // Attr value "02 00" = one AS_SEQUENCE segment with count 0.
+        let attr_bytes = [0x40, 0x02, 0x02, 0x02, 0x00];
+        let err = PathAttribute::parse(&attr_bytes).unwrap_err();
+        match err {
+            ParseError::Update { subcode, action, .. } => {
+                assert_eq!(subcode, UpdateMessageSubcode::MalformedAsPath as u8);
+                assert_eq!(action, AttributeErrorAction::SessionReset);
+            }
+            other => panic!("wrong error kind: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn as_path_encode_strips_empty_segments() {
+        // Defensive: if an empty segment somehow ends up in our
+        // internal state, the encoder drops it rather than putting
+        // an RFC-violating "02 00" on the wire.
+        let attr = PathAttribute::AsPath(vec![AsPathSegment {
+            seg_type: AsPathSegmentType::AsSequence,
+            asns: vec![],
+        }]);
+        let bytes = attr.encode();
+        assert_eq!(bytes, vec![0x40, 0x02, 0x00], "got {:02x?}", bytes);
+    }
+
+    #[test]
+    fn as_path_encode_keeps_valid_segments_when_empty_mixed_in() {
+        // An empty segment followed by a valid one: the empty one
+        // is dropped, the valid one is preserved.
+        let attr = PathAttribute::AsPath(vec![
+            AsPathSegment {
+                seg_type: AsPathSegmentType::AsSequence,
+                asns: vec![],
+            },
+            AsPathSegment {
+                seg_type: AsPathSegmentType::AsSequence,
+                asns: vec![65100],
+            },
+        ]);
+        let bytes = attr.encode();
+        // flags 0x40, type 2, length 6, seg_type 2, count 1, asn 65100 (4 bytes be)
+        assert_eq!(
+            bytes,
+            vec![0x40, 0x02, 0x06, 0x02, 0x01, 0x00, 0x00, 0xfe, 0x4c],
+            "got {:02x?}",
+            bytes
+        );
     }
 
     #[test]
