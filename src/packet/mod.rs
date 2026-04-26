@@ -25,3 +25,20 @@ pub mod notification;
 pub mod open;
 pub mod refresh;
 pub mod update;
+
+// Big-endian byte readers used across the wire parsers. Each
+// expects the caller to have already validated `buf.len()` — we
+// panic on a short buffer rather than return an error, because
+// reaching one of these with an unchecked buffer is a parser bug,
+// not a peer bug.
+pub(crate) fn read_u16_be(buf: &[u8]) -> u16 {
+    u16::from_be_bytes([buf[0], buf[1]])
+}
+
+pub(crate) fn read_u32_be(buf: &[u8]) -> u32 {
+    u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]])
+}
+
+pub(crate) fn read_ipv4(buf: &[u8]) -> std::net::Ipv4Addr {
+    std::net::Ipv4Addr::from([buf[0], buf[1], buf[2], buf[3]])
+}

@@ -113,18 +113,15 @@ fn first_as(r: &StoredRoute) -> Option<u32> {
 }
 
 /// Pick the best route from a slice of candidates. Returns the
-/// winning index, or `None` if `candidates` is empty.
+/// winning index, or `None` if `candidates` is empty. `min_by`
+/// preserves the first-seen winner on ties, matching the
+/// historical index-loop behaviour.
 pub fn select_best(candidates: &[StoredRoute]) -> Option<usize> {
-    if candidates.is_empty() {
-        return None;
-    }
-    let mut best = 0;
-    for i in 1..candidates.len() {
-        if compare(&candidates[i], &candidates[best]) == Ordering::Less {
-            best = i;
-        }
-    }
-    Some(best)
+    candidates
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| compare(a, b))
+        .map(|(i, _)| i)
 }
 
 #[cfg(test)]

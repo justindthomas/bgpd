@@ -33,6 +33,30 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::error::{AttributeErrorAction, ErrorCode, ParseError, UpdateMessageSubcode};
+use crate::packet::{read_ipv4, read_u16_be, read_u32_be};
+
+/// Demand that an attribute's value is exactly `expected` bytes.
+/// Returns a `ParseError::Update` carrying the per-attribute
+/// `subcode` and RFC 7606 `action` (different attribute types
+/// disagree on which subcode to flag and whether the failure is
+/// session-fatal, treat-as-withdraw, or attribute-discard).
+fn expect_value_len(
+    value: &[u8],
+    expected: usize,
+    name: &str,
+    subcode: UpdateMessageSubcode,
+    action: AttributeErrorAction,
+) -> Result<(), ParseError> {
+    if value.len() == expected {
+        return Ok(());
+    }
+    Err(ParseError::Update {
+        code: ErrorCode::UpdateMessage,
+        subcode: subcode as u8,
+        message: format!("{} must be {} bytes, got {}", name, expected, value.len()),
+        action,
+    })
+}
 
 // Attribute type codes (IANA "BGP Path Attributes").
 pub const ATTR_ORIGIN: u8 = 1;
@@ -382,14 +406,13 @@ impl PathAttribute {
         let value = &buf[header_len..header_len + value_len];
         let attr = match type_code {
             ATTR_ORIGIN => {
-                if value.len() != 1 {
-                    return Err(ParseError::Update {
-                        code: ErrorCode::UpdateMessage,
-                        subcode: UpdateMessageSubcode::AttributeLengthError as u8,
-                        message: format!("ORIGIN must be 1 byte, got {}", value.len()),
-                        action: AttributeErrorAction::TreatAsWithdraw,
-                    });
-                }
+                expect_value_len(
+                    value,
+                    1,
+                    "ORIGIN",
+                    UpdateMessageSubcode::AttributeLengthError,
+                    AttributeErrorAction::TreatAsWithdraw,
+                )?;
                 PathAttribute::Origin(Origin::from_u8(value[0])?)
             }
             ATTR_AS_PATH => {
@@ -403,56 +426,43 @@ impl PathAttribute {
                 PathAttribute::AsPath(segments)
             }
             ATTR_NEXT_HOP => {
-                if value.len() != 4 {
-                    return Err(ParseError::Update {
-                        code: ErrorCode::UpdateMessage,
-                        subcode: UpdateMessageSubcode::InvalidNextHopAttribute as u8,
-                        message: format!("NEXT_HOP must be 4 bytes, got {}", value.len()),
-                        action: AttributeErrorAction::TreatAsWithdraw,
-                    });
-                }
-                PathAttribute::NextHop(Ipv4Addr::from([
-                    value[0], value[1], value[2], value[3],
-                ]))
+                expect_value_len(
+                    value,
+                    4,
+                    "NEXT_HOP",
+                    UpdateMessageSubcode::InvalidNextHopAttribute,
+                    AttributeErrorAction::TreatAsWithdraw,
+                )?;
+                PathAttribute::NextHop(read_ipv4(value))
             }
             ATTR_MULTI_EXIT_DISC => {
-                if value.len() != 4 {
-                    return Err(ParseError::Update {
-                        code: ErrorCode::UpdateMessage,
-                        subcode: UpdateMessageSubcode::AttributeLengthError as u8,
-                        message: format!("MED must be 4 bytes, got {}", value.len()),
-                        action: AttributeErrorAction::TreatAsWithdraw,
-                    });
-                }
-                PathAttribute::MultiExitDisc(u32::from_be_bytes([
-                    value[0], value[1], value[2], value[3],
-                ]))
+                expect_value_len(
+                    value,
+                    4,
+                    "MED",
+                    UpdateMessageSubcode::AttributeLengthError,
+                    AttributeErrorAction::TreatAsWithdraw,
+                )?;
+                PathAttribute::MultiExitDisc(read_u32_be(value))
             }
             ATTR_LOCAL_PREF => {
-                if value.len() != 4 {
-                    return Err(ParseError::Update {
-                        code: ErrorCode::UpdateMessage,
-                        subcode: UpdateMessageSubcode::AttributeLengthError as u8,
-                        message: format!("LOCAL_PREF must be 4 bytes, got {}", value.len()),
-                        action: AttributeErrorAction::TreatAsWithdraw,
-                    });
-                }
-                PathAttribute::LocalPref(u32::from_be_bytes([
-                    value[0], value[1], value[2], value[3],
-                ]))
+                expect_value_len(
+                    value,
+                    4,
+                    "LOCAL_PREF",
+                    UpdateMessageSubcode::AttributeLengthError,
+                    AttributeErrorAction::TreatAsWithdraw,
+                )?;
+                PathAttribute::LocalPref(read_u32_be(value))
             }
             ATTR_ATOMIC_AGGREGATE => {
-                if !value.is_empty() {
-                    return Err(ParseError::Update {
-                        code: ErrorCode::UpdateMessage,
-                        subcode: UpdateMessageSubcode::AttributeLengthError as u8,
-                        message: format!(
-                            "ATOMIC_AGGREGATE must be 0 bytes, got {}",
-                            value.len()
-                        ),
-                        action: AttributeErrorAction::AttributeDiscard,
-                    });
-                }
+                expect_value_len(
+                    value,
+                    0,
+                    "ATOMIC_AGGREGATE",
+                    UpdateMessageSubcode::AttributeLengthError,
+                    AttributeErrorAction::AttributeDiscard,
+                )?;
                 PathAttribute::AtomicAggregate
             }
             ATTR_AGGREGATOR => {
@@ -461,17 +471,17 @@ impl PathAttribute {
                 // form (2-byte ASN) is technically possible from an
                 // ancient peer; we treat it as malformed and
                 // discard the attribute (RFC 7606 §6).
-                if value.len() != 8 {
-                    return Err(ParseError::Update {
-                        code: ErrorCode::UpdateMessage,
-                        subcode: UpdateMessageSubcode::AttributeLengthError as u8,
-                        message: format!("AGGREGATOR must be 8 bytes (4-octet ASN), got {}", value.len()),
-                        action: AttributeErrorAction::AttributeDiscard,
-                    });
+                expect_value_len(
+                    value,
+                    8,
+                    "AGGREGATOR (4-octet ASN)",
+                    UpdateMessageSubcode::AttributeLengthError,
+                    AttributeErrorAction::AttributeDiscard,
+                )?;
+                PathAttribute::Aggregator {
+                    asn: read_u32_be(&value[..4]),
+                    addr: read_ipv4(&value[4..]),
                 }
-                let asn = u32::from_be_bytes([value[0], value[1], value[2], value[3]]);
-                let addr = Ipv4Addr::from([value[4], value[5], value[6], value[7]]);
-                PathAttribute::Aggregator { asn, addr }
             }
             ATTR_COMMUNITIES => {
                 if value.len() % 4 != 0 {
@@ -485,12 +495,7 @@ impl PathAttribute {
                         action: AttributeErrorAction::AttributeDiscard,
                     });
                 }
-                let mut cs = Vec::with_capacity(value.len() / 4);
-                for chunk in value.chunks(4) {
-                    cs.push(u32::from_be_bytes([
-                        chunk[0], chunk[1], chunk[2], chunk[3],
-                    ]));
-                }
+                let cs = value.chunks(4).map(read_u32_be).collect();
                 PathAttribute::Communities(cs)
             }
             ATTR_MP_REACH_NLRI => {
@@ -504,7 +509,7 @@ impl PathAttribute {
                         action: AttributeErrorAction::TreatAsWithdraw,
                     });
                 }
-                let afi = u16::from_be_bytes([value[0], value[1]]);
+                let afi = read_u16_be(value);
                 let safi = value[2];
                 let nh_len = value[3] as usize;
                 if value.len() < 4 + nh_len + 1 {
@@ -534,13 +539,10 @@ impl PathAttribute {
                         action: AttributeErrorAction::TreatAsWithdraw,
                     });
                 }
-                let afi = u16::from_be_bytes([value[0], value[1]]);
-                let safi = value[2];
-                let withdrawn = value[3..].to_vec();
                 PathAttribute::MpUnreachNlri {
-                    afi,
-                    safi,
-                    withdrawn,
+                    afi: read_u16_be(value),
+                    safi: value[2],
+                    withdrawn: value[3..].to_vec(),
                 }
             }
             _ => PathAttribute::Unknown {

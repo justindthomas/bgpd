@@ -53,14 +53,13 @@ impl LocRib {
                     .push(route.clone());
             }
         }
-        for (prefix, candidates) in v4_buckets {
+        for (prefix, mut candidates) in v4_buckets {
             if let Some(idx) = bestpath::select_best(&candidates) {
                 let count = candidates.len();
-                let winner = candidates.into_iter().nth(idx).unwrap();
                 out.v4_unicast.insert(
                     prefix,
                     LocRibEntry {
-                        winner,
+                        winner: candidates.swap_remove(idx),
                         candidate_count: count,
                     },
                 );
@@ -77,14 +76,13 @@ impl LocRib {
                     .push(route.clone());
             }
         }
-        for (prefix, candidates) in v6_buckets {
+        for (prefix, mut candidates) in v6_buckets {
             if let Some(idx) = bestpath::select_best(&candidates) {
                 let count = candidates.len();
-                let winner = candidates.into_iter().nth(idx).unwrap();
                 out.v6_unicast.insert(
                     prefix,
                     LocRibEntry {
-                        winner,
+                        winner: candidates.swap_remove(idx),
                         candidate_count: count,
                     },
                 );

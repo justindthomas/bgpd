@@ -41,6 +41,7 @@ use std::net::Ipv4Addr;
 use crate::error::{ErrorCode, OpenMessageSubcode, ParseError};
 use crate::packet::caps::{Capability, CAPABILITY_FOUR_OCTET_ASN};
 use crate::packet::header::{Header, MessageType, HEADER_LEN};
+use crate::packet::{read_ipv4, read_u16_be};
 
 /// BGP version field. RFC 4271 fixes this at 4 (and there is no 5).
 pub const BGP_VERSION: u8 = 4;
@@ -157,9 +158,9 @@ impl Open {
                 message: format!("unsupported BGP version {}", version),
             });
         }
-        let wire_asn = u16::from_be_bytes([body[1], body[2]]);
-        let hold_time = u16::from_be_bytes([body[3], body[4]]);
-        let bgp_identifier = Ipv4Addr::from([body[5], body[6], body[7], body[8]]);
+        let wire_asn = read_u16_be(&body[1..3]);
+        let hold_time = read_u16_be(&body[3..5]);
+        let bgp_identifier = read_ipv4(&body[5..9]);
         let opt_parm_len = body[9] as usize;
         if body.len() < 10 + opt_parm_len {
             return Err(ParseError::Open {

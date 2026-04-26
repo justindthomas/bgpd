@@ -26,7 +26,7 @@
 //! over-pushing is correct, just wasteful.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -228,13 +228,11 @@ impl BgpInstance {
     /// Called after `rebuild_local_pseudo_rib` at startup and after
     /// every Loc-RIB rebuild in the event loop.
     fn recompute_aggregates(&mut self) {
-        use crate::packet::attrs::{Origin as BgpOrigin, PathAttribute};
-        use crate::packet::caps::{AFI_IPV6, SAFI_UNICAST};
-
         let local_router_id = self
             .config
             .router_id
-            .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
+            .unwrap_or(Ipv4Addr::UNSPECIFIED);
+        let local_asn = self.config.local_asn;
 
         for (agg, _summary_only) in &self.parsed_aggregates_v4 {
             let has_contributor = self
@@ -244,18 +242,7 @@ impl BgpInstance {
                 .any(|p| is_more_specific_v4(agg, p));
             if has_contributor {
                 if !self.local_pseudo_rib.v4_unicast.contains_key(agg) {
-                    let route = StoredRoute::local_origin(
-                        vec![
-                            PathAttribute::Origin(BgpOrigin::Igp),
-                            PathAttribute::AsPath(Vec::new()),
-                            PathAttribute::NextHop(std::net::Ipv4Addr::UNSPECIFIED),
-                            PathAttribute::LocalPref(100),
-                            PathAttribute::AtomicAggregate,
-                        ],
-                        self.config.local_asn,
-                        local_router_id,
-                        OriginClass::Aggregate,
-                    );
+                    let route = make_v4_aggregate_route(local_asn, local_router_id);
                     self.local_pseudo_rib.insert_v4(*agg, route);
                 }
             } else {
@@ -271,23 +258,7 @@ impl BgpInstance {
                 .any(|p| is_more_specific_v6(agg, p));
             if has_contributor {
                 if !self.local_pseudo_rib.v6_unicast.contains_key(agg) {
-                    let route = StoredRoute::local_origin(
-                        vec![
-                            PathAttribute::Origin(BgpOrigin::Igp),
-                            PathAttribute::AsPath(Vec::new()),
-                            PathAttribute::LocalPref(100),
-                            PathAttribute::AtomicAggregate,
-                            PathAttribute::MpReachNlri {
-                                afi: AFI_IPV6,
-                                safi: SAFI_UNICAST,
-                                nexthop: vec![0u8; 16],
-                                nlri: Vec::new(),
-                            },
-                        ],
-                        self.config.local_asn,
-                        local_router_id,
-                        OriginClass::Aggregate,
-                    );
+                    let route = make_v6_aggregate_route(local_asn, local_router_id);
                     self.local_pseudo_rib.insert_v6(*agg, route);
                 }
             } else {
@@ -800,12 +771,12 @@ impl BgpInstance {
             let mut snap = self.snapshot.lock().await;
             if let Some(peer) = snap.peers.iter_mut().find(|p| p.id == pid) {
                 let before = peer.adj_rib_in.len();
-                peer.adj_rib_in.v4_unicast.retain(|prefix, stored| {
-                    new_policy.import.apply_v4(prefix, stored.clone()).is_some()
-                });
-                peer.adj_rib_in.v6_unicast.retain(|prefix, stored| {
-                    new_policy.import.apply_v6(prefix, stored.clone()).is_some()
-                });
+                peer.adj_rib_in
+                    .v4_unicast
+                    .retain(|prefix, _| new_policy.import.permits_v4(prefix));
+                peer.adj_rib_in
+                    .v6_unicast
+                    .retain(|prefix, _| new_policy.import.permits_v6(prefix));
                 let after = peer.adj_rib_in.len();
                 if before != after {
                     tracing::info!(
@@ -967,16 +938,11 @@ impl BgpInstance {
         Ok(())
     }
 
-    /// Build per-AFI UPDATE messages from the local-origin set
-    /// and push them to the peer's send queue. The peer driver's
-    /// `PeerControl::SendUpdate` handler is fail-safe — if the
-    /// peer isn't actually `Established` by the time the message
-    /// arrives, it's dropped with a warning rather than queued.
-    /// Walk the current Loc-RIB, compute the set of prefixes
-    /// this peer should have in its Adj-RIB-Out (after
-    /// split-horizon + export policy), diff against the cached
-    /// previous set, and emit withdraws + announces for the
-    /// delta. This is the unified outbound path that handles:
+    /// Walk the current Loc-RIB, compute the set of prefixes this
+    /// peer should have in its Adj-RIB-Out (after split-horizon +
+    /// export policy + summary-only suppression), diff against the
+    /// cached previous set, and emit withdraws + announces for the
+    /// delta. The unified outbound path covers:
     ///
     /// - Session-up: `adj_rib_out[peer]` starts empty, so every
     ///   Loc-RIB winner becomes a fresh announce.
@@ -990,79 +956,86 @@ impl BgpInstance {
     ///   rebuild drops those winners and this function emits
     ///   withdraws to every remaining peer.
     ///
-    /// Outbound rewrites (AS_PATH prepend, next-hop-self,
-    /// LOCAL_PREF strip on eBGP) come from `build_outbound_*_attrs`.
-    /// Announces are batched by source peer_id so routes sharing
-    /// a winner also share a single UPDATE — the one round of
-    /// grouping RFC 4271 §5.1.2 guarantees is safe.
+    /// Implemented as four phases — `resolve_advertise_ctx`,
+    /// `collect_outbound_routes`, `send_withdraws`, `send_announces` —
+    /// so each step is independently testable. Outbound rewrites
+    /// (AS_PATH prepend, next-hop-self, LOCAL_PREF strip on eBGP)
+    /// come from [`build_outbound_attrs`]. Announces are batched
+    /// by source peer_id: routes sharing a winner share path
+    /// attributes, and RFC 4271 §5.1.2 guarantees one UPDATE per
+    /// group is safe.
     async fn advertise_to_peer(&mut self, peer_id: PeerId) {
-        // Peer metadata: is_ebgp, export policy, send channel.
-        let tx = match self.peer_controls.get(&peer_id).cloned() {
-            Some(t) => t,
-            None => return,
-        };
-        let (is_ebgp, state_is_established) = {
-            let snap = self.snapshot.lock().await;
-            let entry = snap.peers.iter().find(|p| p.id == peer_id);
-            match entry {
-                Some(p) => (p.is_ebgp, p.state == PeerState::Established),
-                None => return,
-            }
-        };
-        if !state_is_established {
+        let Some(ctx) = self.resolve_advertise_ctx(peer_id).await else {
             return;
+        };
+        let (should, groups) = self.collect_outbound_routes(peer_id, &ctx).await;
+        let prior = self.adj_rib_out.entry(peer_id).or_default().clone();
+        Self::send_withdraws(&ctx, &prior, &should).await;
+        Self::send_announces(&ctx, groups).await;
+        self.adj_rib_out.insert(peer_id, should);
+    }
+
+    /// Phase 1: assemble the per-peer state needed to advertise.
+    /// Returns `None` (and the caller silently skips) if the peer
+    /// is gone, not Established, or has no resolvable local TCP
+    /// address yet.
+    async fn resolve_advertise_ctx(&self, peer_id: PeerId) -> Option<AdvertiseCtx> {
+        let tx = self.peer_controls.get(&peer_id).cloned()?;
+        let (is_ebgp, established) = {
+            let snap = self.snapshot.lock().await;
+            let p = snap.peers.iter().find(|p| p.id == peer_id)?;
+            (p.is_ebgp, p.state == PeerState::Established)
+        };
+        if !established {
+            return None;
         }
         let export_policy = self
             .peer_policies
             .get(&peer_id)
             .map(|pp| pp.export.clone())
             .unwrap_or_default();
-        let local_asn = self.config.local_asn;
 
-        // Look up local TCP address — needed for next-hop-self.
-        let local_addr = {
-            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-            if tx.send(PeerControl::QueryLocalAddr(reply_tx)).await.is_err() {
-                tracing::warn!(peer_id, "peer task gone, skipping advertise");
-                return;
-            }
-            match reply_rx.await {
-                Ok(Some(addr)) => addr,
-                _ => {
-                    tracing::warn!(peer_id, "peer has no local addr, skipping advertise");
-                    return;
-                }
-            }
+        // Local TCP address feeds next-hop-self.
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        if tx.send(PeerControl::QueryLocalAddr(reply_tx)).await.is_err() {
+            tracing::warn!(peer_id, "peer task gone, skipping advertise");
+            return None;
+        }
+        let Ok(Some(local_addr)) = reply_rx.await else {
+            tracing::warn!(peer_id, "peer has no local addr, skipping advertise");
+            return None;
         };
-        let nh_v4 = match local_addr.ip() {
-            std::net::IpAddr::V4(v4) => Some(v4),
-            _ => None,
-        };
-        let nh_v6 = match local_addr.ip() {
-            std::net::IpAddr::V6(v6) => Some(v6),
-            _ => None,
+        let (nh_v4, nh_v6) = match local_addr.ip() {
+            IpAddr::V4(v4) => (Some(v4), None),
+            IpAddr::V6(v6) => (None, Some(v6)),
         };
 
-        // Rebuild Loc-RIB (the caller may have just updated a
-        // peer's Adj-RIB-In, so we want the freshest view).
+        Some(AdvertiseCtx {
+            tx,
+            is_ebgp,
+            export_policy,
+            local_asn: self.config.local_asn,
+            nh_v4,
+            nh_v6,
+        })
+    }
+
+    /// Phase 2: rebuild Loc-RIB and produce the prefix set this
+    /// peer should currently have, partitioned by source peer for
+    /// per-group UPDATE batching.
+    ///
+    /// Filters in order: split-horizon (never echo a route back to
+    /// its origin), export policy, summary-only suppression for
+    /// active aggregates.
+    async fn collect_outbound_routes(
+        &self,
+        peer_id: PeerId,
+        ctx: &AdvertiseCtx,
+    ) -> (AdvertisedPrefixes, OutboundGroups) {
         let snap = self.snapshot.lock().await;
         let loc = rebuild_loc_rib(&snap.peers, &self.local_pseudo_rib);
         drop(snap);
 
-        // Compute "what should be advertised" as sets of prefixes
-        // grouped by source peer_id — winners from the same
-        // source share path attributes, so one UPDATE per group
-        // is optimal.
-        let mut v4_by_source: HashMap<PeerId, Vec<(Prefix4, StoredRoute)>> =
-            HashMap::new();
-        let mut v6_by_source: HashMap<PeerId, Vec<(Prefix6, StoredRoute)>> =
-            HashMap::new();
-        let mut should_v4: std::collections::HashSet<Prefix4> =
-            std::collections::HashSet::new();
-        let mut should_v6: std::collections::HashSet<Prefix6> =
-            std::collections::HashSet::new();
-
-        // Collect summary-only aggregate prefixes for suppression.
         let suppressed_v4: Vec<&Prefix4> = self
             .parsed_aggregates_v4
             .iter()
@@ -1076,96 +1049,101 @@ impl BgpInstance {
             .map(|(p, _)| p)
             .collect();
 
-        if nh_v4.is_some() {
+        let mut should = AdvertisedPrefixes::default();
+        let mut groups = OutboundGroups::default();
+
+        if ctx.nh_v4.is_some() {
             for (prefix, entry) in &loc.v4_unicast {
-                // Split-horizon: never re-advertise a route back
-                // to the peer that originated it.
                 if entry.winner.peer_id == peer_id {
                     continue;
                 }
-                if export_policy
-                    .apply_v4(prefix, entry.winner.clone())
-                    .is_none()
-                {
+                if !ctx.export_policy.permits_v4(prefix) {
                     continue;
                 }
-                // summary-only suppression: if this prefix is a
-                // more-specific of an active summary_only aggregate,
-                // suppress it (the aggregate itself will be
-                // advertised instead).
-                if suppressed_v4
-                    .iter()
-                    .any(|agg| is_more_specific_v4(agg, prefix))
-                {
+                if suppressed_v4.iter().any(|agg| is_more_specific_v4(agg, prefix)) {
                     continue;
                 }
-                should_v4.insert(*prefix);
-                v4_by_source
+                should.v4.insert(*prefix);
+                groups
+                    .v4
                     .entry(entry.winner.peer_id)
                     .or_default()
                     .push((*prefix, entry.winner.clone()));
             }
         }
-        if nh_v6.is_some() {
+        if ctx.nh_v6.is_some() {
             for (prefix, entry) in &loc.v6_unicast {
                 if entry.winner.peer_id == peer_id {
                     continue;
                 }
-                if export_policy
-                    .apply_v6(prefix, entry.winner.clone())
-                    .is_none()
-                {
+                if !ctx.export_policy.permits_v6(prefix) {
                     continue;
                 }
-                if suppressed_v6
-                    .iter()
-                    .any(|agg| is_more_specific_v6(agg, prefix))
-                {
+                if suppressed_v6.iter().any(|agg| is_more_specific_v6(agg, prefix)) {
                     continue;
                 }
-                should_v6.insert(*prefix);
-                v6_by_source
+                should.v6.insert(*prefix);
+                groups
+                    .v6
                     .entry(entry.winner.peer_id)
                     .or_default()
                     .push((*prefix, entry.winner.clone()));
             }
         }
 
-        // Diff against the previously-sent set. Withdraws go
-        // first per RFC 4271 §9.1.4.
-        let prior = self
-            .adj_rib_out
-            .entry(peer_id)
-            .or_default()
-            .clone();
-        let withdraw_v4: Vec<Prefix4> =
-            prior.v4.iter().filter(|p| !should_v4.contains(p)).copied().collect();
-        let withdraw_v6: Vec<Prefix6> =
-            prior.v6.iter().filter(|p| !should_v6.contains(p)).copied().collect();
+        (should, groups)
+    }
 
-        if nh_v4.is_some() && !withdraw_v4.is_empty() {
-            let _ = tx
-                .send(PeerControl::SendUpdate(build_withdraw_v4(&withdraw_v4)))
-                .await;
+    /// Phase 3: emit withdraws for prefixes the peer used to have
+    /// but no longer should. RFC 4271 §9.1.4 — withdraws precede
+    /// announces.
+    async fn send_withdraws(
+        ctx: &AdvertiseCtx,
+        prior: &AdvertisedPrefixes,
+        should: &AdvertisedPrefixes,
+    ) {
+        if ctx.nh_v4.is_some() {
+            let withdraw: Vec<Prefix4> = prior
+                .v4
+                .iter()
+                .filter(|p| !should.v4.contains(p))
+                .copied()
+                .collect();
+            if !withdraw.is_empty() {
+                let _ = ctx
+                    .tx
+                    .send(PeerControl::SendUpdate(build_withdraw_v4(&withdraw)))
+                    .await;
+            }
         }
-        if nh_v6.is_some() && !withdraw_v6.is_empty() {
-            let _ = tx
-                .send(PeerControl::SendUpdate(build_withdraw_v6(&withdraw_v6)))
-                .await;
+        if ctx.nh_v6.is_some() {
+            let withdraw: Vec<Prefix6> = prior
+                .v6
+                .iter()
+                .filter(|p| !should.v6.contains(p))
+                .copied()
+                .collect();
+            if !withdraw.is_empty() {
+                let _ = ctx
+                    .tx
+                    .send(PeerControl::SendUpdate(build_withdraw_v6(&withdraw)))
+                    .await;
+            }
         }
+    }
 
-        // Announces: one UPDATE per source group. A group's
-        // winner is representative — all prefixes in the group
-        // share the same StoredRoute so they share the same
-        // rewritten outbound attributes.
-        if let Some(nh) = nh_v4 {
-            for (_src, group) in v4_by_source.iter() {
+    /// Phase 4: emit one UPDATE per source group. Routes sharing a
+    /// source share path attributes, so RFC 4271 §5.1.2 lets us
+    /// batch them under one set of rewritten outbound attributes.
+    async fn send_announces(ctx: &AdvertiseCtx, groups: OutboundGroups) {
+        if let Some(nh) = ctx.nh_v4 {
+            for group in groups.v4.into_values() {
                 let representative = &group[0].1;
                 let prefixes: Vec<Prefix4> = group.iter().map(|(p, _)| *p).collect();
                 let attrs = build_outbound_v4_attrs(
                     representative,
-                    is_ebgp,
-                    local_asn,
+                    ctx.is_ebgp,
+                    ctx.local_asn,
                     nh,
                 );
                 let update = Update {
@@ -1173,18 +1151,18 @@ impl BgpInstance {
                     path_attributes: attrs,
                     nlri_v4: prefixes,
                 };
-                let _ = tx.send(PeerControl::SendUpdate(update)).await;
+                let _ = ctx.tx.send(PeerControl::SendUpdate(update)).await;
             }
         }
-        if let Some(nh) = nh_v6 {
-            for (_src, group) in v6_by_source.iter() {
+        if let Some(nh) = ctx.nh_v6 {
+            for group in groups.v6.into_values() {
                 let representative = &group[0].1;
                 let prefixes: Vec<Prefix6> = group.iter().map(|(p, _)| *p).collect();
                 let nlri_bytes = encode_v6_nlri(&prefixes);
                 let attrs = build_outbound_v6_attrs(
                     representative,
-                    is_ebgp,
-                    local_asn,
+                    ctx.is_ebgp,
+                    ctx.local_asn,
                     nh,
                     nlri_bytes,
                 );
@@ -1193,18 +1171,9 @@ impl BgpInstance {
                     path_attributes: attrs,
                     nlri_v4: Vec::new(),
                 };
-                let _ = tx.send(PeerControl::SendUpdate(update)).await;
+                let _ = ctx.tx.send(PeerControl::SendUpdate(update)).await;
             }
         }
-
-        // Refresh the Adj-RIB-Out cache for next diff.
-        self.adj_rib_out.insert(
-            peer_id,
-            AdvertisedPrefixes {
-                v4: should_v4,
-                v6: should_v6,
-            },
-        );
     }
 
     /// Fan out a Loc-RIB change to every Established peer.
@@ -1237,12 +1206,19 @@ impl BgpInstance {
 /// Used by `advertise_local_origin` on session-up and by the
 /// SIGHUP reload-delta path. Pure function so it's easy to
 /// unit-test in isolation.
-pub fn build_announce_v4(
-    prefixes: &[Prefix4],
-    next_hop: std::net::Ipv4Addr,
-    is_ebgp: bool,
-    local_asn: u32,
-) -> Update {
+/// Address-family input for [`build_announce`]. Each variant
+/// carries the prefixes to announce and the next-hop to advertise.
+enum AnnounceAfi<'a> {
+    V4 { prefixes: &'a [Prefix4], next_hop: Ipv4Addr },
+    V6 { prefixes: &'a [Prefix6], next_hop: Ipv6Addr },
+}
+
+/// Build an outbound UPDATE for a freshly-originated set of
+/// prefixes (local-origin or aggregate). Common path: ORIGIN(IGP),
+/// AS_PATH (eBGP prepends `local_asn`; iBGP empty), LOCAL_PREF=100
+/// on iBGP only. AFI tail is either inline NEXT_HOP + nlri_v4 (v4)
+/// or a trailing MP_REACH_NLRI (v6, RFC 4760 §3).
+fn build_announce(afi: AnnounceAfi<'_>, is_ebgp: bool, local_asn: u32) -> Update {
     let as_path = if is_ebgp {
         vec![AsPathSegment {
             seg_type: AsPathSegmentType::AsSequence,
@@ -1254,16 +1230,53 @@ pub fn build_announce_v4(
     let mut path_attributes = vec![
         PathAttribute::Origin(Origin::Igp),
         PathAttribute::AsPath(as_path),
-        PathAttribute::NextHop(next_hop),
     ];
-    if !is_ebgp {
-        path_attributes.push(PathAttribute::LocalPref(100));
-    }
+
+    let nlri_v4 = match afi {
+        AnnounceAfi::V4 { prefixes, next_hop } => {
+            path_attributes.push(PathAttribute::NextHop(next_hop));
+            if !is_ebgp {
+                path_attributes.push(PathAttribute::LocalPref(100));
+            }
+            prefixes.to_vec()
+        }
+        AnnounceAfi::V6 { prefixes, next_hop } => {
+            if !is_ebgp {
+                path_attributes.push(PathAttribute::LocalPref(100));
+            }
+            path_attributes.push(PathAttribute::MpReachNlri {
+                afi: AFI_IPV6,
+                safi: SAFI_UNICAST,
+                nexthop: next_hop.octets().to_vec(),
+                nlri: encode_v6_nlri(prefixes),
+            });
+            Vec::new()
+        }
+    };
+
     Update {
         withdrawn_v4: Vec::new(),
         path_attributes,
-        nlri_v4: prefixes.to_vec(),
+        nlri_v4,
     }
+}
+
+pub fn build_announce_v4(
+    prefixes: &[Prefix4],
+    next_hop: Ipv4Addr,
+    is_ebgp: bool,
+    local_asn: u32,
+) -> Update {
+    build_announce(AnnounceAfi::V4 { prefixes, next_hop }, is_ebgp, local_asn)
+}
+
+pub fn build_announce_v6(
+    prefixes: &[Prefix6],
+    next_hop: Ipv6Addr,
+    is_ebgp: bool,
+    local_asn: u32,
+) -> Update {
+    build_announce(AnnounceAfi::V6 { prefixes, next_hop }, is_ebgp, local_asn)
 }
 
 /// Build an outbound IPv4 withdraw UPDATE. The withdrawn-routes
@@ -1283,64 +1296,13 @@ pub fn build_withdraw_v4(prefixes: &[Prefix4]) -> Update {
 /// must be present in a v6 withdraw UPDATE; the legacy
 /// withdrawn-routes field stays empty.
 pub fn build_withdraw_v6(prefixes: &[Prefix6]) -> Update {
-    let mut withdrawn_bytes = Vec::new();
-    for p in prefixes {
-        withdrawn_bytes.push(p.len);
-        let nbytes = (p.len as usize + 7) / 8;
-        withdrawn_bytes.extend_from_slice(&p.addr.octets()[..nbytes]);
-    }
     Update {
         withdrawn_v4: Vec::new(),
         path_attributes: vec![PathAttribute::MpUnreachNlri {
             afi: AFI_IPV6,
             safi: SAFI_UNICAST,
-            withdrawn: withdrawn_bytes,
+            withdrawn: encode_v6_nlri(prefixes),
         }],
-        nlri_v4: Vec::new(),
-    }
-}
-
-/// Build an outbound IPv6 UPDATE via MP_REACH_NLRI. Same
-/// peer-type rules as `build_announce_v4`: eBGP prepends
-/// `local_asn` and omits LOCAL_PREF; iBGP uses empty AS_PATH
-/// and includes LOCAL_PREF=100.
-pub fn build_announce_v6(
-    prefixes: &[Prefix6],
-    next_hop: std::net::Ipv6Addr,
-    is_ebgp: bool,
-    local_asn: u32,
-) -> Update {
-    let mut nlri_bytes = Vec::new();
-    for p in prefixes {
-        nlri_bytes.push(p.len);
-        let nbytes = (p.len as usize + 7) / 8;
-        nlri_bytes.extend_from_slice(&p.addr.octets()[..nbytes]);
-    }
-    let next_hop_bytes = next_hop.octets().to_vec();
-    let as_path = if is_ebgp {
-        vec![AsPathSegment {
-            seg_type: AsPathSegmentType::AsSequence,
-            asns: vec![local_asn],
-        }]
-    } else {
-        Vec::new()
-    };
-    let mut path_attributes = vec![
-        PathAttribute::Origin(Origin::Igp),
-        PathAttribute::AsPath(as_path),
-    ];
-    if !is_ebgp {
-        path_attributes.push(PathAttribute::LocalPref(100));
-    }
-    path_attributes.push(PathAttribute::MpReachNlri {
-        afi: AFI_IPV6,
-        safi: SAFI_UNICAST,
-        nexthop: next_hop_bytes,
-        nlri: nlri_bytes,
-    });
-    Update {
-        withdrawn_v4: Vec::new(),
-        path_attributes,
         nlri_v4: Vec::new(),
     }
 }
@@ -1397,10 +1359,7 @@ fn apply_update_to_peer(
             ipv4_or_unspec(peer.address),
         );
         for prefix in &update.nlri_v4 {
-            if import_policy
-                .apply_v4(prefix, stored.clone())
-                .is_some()
-            {
+            if import_policy.permits_v4(prefix) {
                 peer.adj_rib_in.insert_v4(*prefix, stored.clone());
             }
         }
@@ -1440,10 +1399,7 @@ fn apply_update_to_peer(
             ipv4_or_unspec(peer.address),
         );
         for prefix in &v6_announce {
-            if import_policy
-                .apply_v6(prefix, stored.clone())
-                .is_some()
-            {
+            if import_policy.permits_v6(prefix) {
                 peer.adj_rib_in.insert_v6(*prefix, stored.clone());
             }
         }
@@ -1509,9 +1465,17 @@ fn rebuild_loc_rib(peers: &[PeerSnapshot], local: &AdjRibIn) -> LocRib {
     LocRib::rebuild(&inputs)
 }
 
-/// Rewrite a winner's path attributes for outbound advertisement
-/// to a specific peer. Implements RFC 4271 §5.1 rules per peer
-/// type:
+/// Address-family tail for [`build_outbound_attrs`]. v4 carries
+/// NEXT_HOP inline as an attribute; v6 routes ride inside
+/// MP_REACH_NLRI (RFC 4760 §3) which bundles next-hop + NLRI bytes.
+enum OutboundAfi {
+    V4 { next_hop: Ipv4Addr },
+    V6 { next_hop: Ipv6Addr, nlri_bytes: Vec<u8> },
+}
+
+/// Rewrite a Loc-RIB winner's path attributes for outbound
+/// advertisement to a specific peer. Implements RFC 4271 §5.1
+/// rules per peer type:
 ///
 /// - **ORIGIN**: preserved from the winner.
 /// - **AS_PATH**:
@@ -1520,28 +1484,27 @@ fn rebuild_loc_rib(peers: &[PeerSnapshot], local: &AdjRibIn) -> LocRib {
 ///     winner's AS_PATH was empty (local-origin) or started
 ///     with an AS_SET.
 ///   - iBGP: preserved unchanged.
-/// - **NEXT_HOP**: always rewritten to `local_next_hop`
-///   (unconditional next-hop-self in v1).
+/// - **NEXT_HOP** (v4): always rewritten to the AFI's
+///   `next_hop` (unconditional next-hop-self in v1). v6 routes
+///   carry the next-hop inside the trailing MP_REACH_NLRI.
 /// - **LOCAL_PREF**: iBGP preserves winner's value or defaults
 ///   to 100; eBGP omits entirely (§5.1.5).
 /// - **MED**: iBGP preserves; eBGP strips by default (operator
 ///   policy can override in v2).
-/// - **Communities**: preserved verbatim v1.
-fn build_outbound_v4_attrs(
+/// - **Communities**: preserved verbatim in v1.
+fn build_outbound_attrs(
     winner: &StoredRoute,
     is_ebgp: bool,
     local_asn: u32,
-    local_next_hop: std::net::Ipv4Addr,
+    afi: OutboundAfi,
 ) -> Vec<PathAttribute> {
     let mut out: Vec<PathAttribute> = Vec::new();
 
-    // ORIGIN.
     let origin = winner
         .find_origin()
         .unwrap_or(crate::packet::attrs::Origin::Incomplete);
     out.push(PathAttribute::Origin(origin));
 
-    // AS_PATH.
     let winner_as_path: Vec<AsPathSegment> = winner
         .path_attributes
         .iter()
@@ -1550,93 +1513,77 @@ fn build_outbound_v4_attrs(
             _ => None,
         })
         .unwrap_or_default();
-    let rewritten_as_path = if is_ebgp {
+    let rewritten = if is_ebgp {
         prepend_local_asn(&winner_as_path, local_asn)
     } else {
         winner_as_path
     };
-    out.push(PathAttribute::AsPath(rewritten_as_path));
+    out.push(PathAttribute::AsPath(rewritten));
 
-    // NEXT_HOP (next-hop-self).
-    out.push(PathAttribute::NextHop(local_next_hop));
+    // v4 carries NEXT_HOP inline before LOCAL_PREF; v6 carries it
+    // inside the trailing MP_REACH_NLRI.
+    let mp_reach = match afi {
+        OutboundAfi::V4 { next_hop } => {
+            out.push(PathAttribute::NextHop(next_hop));
+            None
+        }
+        OutboundAfi::V6 { next_hop, nlri_bytes } => Some((next_hop, nlri_bytes)),
+    };
 
-    // LOCAL_PREF: iBGP-only.
+    // iBGP-only: LOCAL_PREF (default 100) and MED (preserve if present).
+    // RFC 4271 §5.1.5 — LOCAL_PREF MUST NOT be sent to eBGP peers.
     if !is_ebgp {
-        let lp = winner.local_pref().unwrap_or(100);
-        out.push(PathAttribute::LocalPref(lp));
-    }
-
-    // MED: iBGP preserves (if present), eBGP strips by default.
-    if !is_ebgp {
+        out.push(PathAttribute::LocalPref(winner.local_pref().unwrap_or(100)));
         if let Some(med) = winner.med() {
             out.push(PathAttribute::MultiExitDisc(med));
         }
     }
 
-    // Communities preserved verbatim.
     for attr in &winner.path_attributes {
         if let PathAttribute::Communities(c) = attr {
             out.push(PathAttribute::Communities(c.clone()));
         }
+    }
+
+    if let Some((next_hop, nlri_bytes)) = mp_reach {
+        out.push(PathAttribute::MpReachNlri {
+            afi: AFI_IPV6,
+            safi: SAFI_UNICAST,
+            nexthop: next_hop.octets().to_vec(),
+            nlri: nlri_bytes,
+        });
     }
 
     out
 }
 
-/// Rewrite a winner's path attributes for a v6 outbound UPDATE.
-/// Same eBGP/iBGP rules as v4, but v6 routes ride inside
-/// MP_REACH_NLRI which carries its own nexthop and nlri bytes.
+fn build_outbound_v4_attrs(
+    winner: &StoredRoute,
+    is_ebgp: bool,
+    local_asn: u32,
+    local_next_hop: Ipv4Addr,
+) -> Vec<PathAttribute> {
+    build_outbound_attrs(
+        winner,
+        is_ebgp,
+        local_asn,
+        OutboundAfi::V4 { next_hop: local_next_hop },
+    )
+}
+
 fn build_outbound_v6_attrs(
     winner: &StoredRoute,
     is_ebgp: bool,
     local_asn: u32,
-    local_next_hop: std::net::Ipv6Addr,
+    local_next_hop: Ipv6Addr,
     nlri_bytes: Vec<u8>,
 ) -> Vec<PathAttribute> {
-    let mut out: Vec<PathAttribute> = Vec::new();
-
-    let origin = winner
-        .find_origin()
-        .unwrap_or(crate::packet::attrs::Origin::Incomplete);
-    out.push(PathAttribute::Origin(origin));
-
-    let winner_as_path: Vec<AsPathSegment> = winner
-        .path_attributes
-        .iter()
-        .find_map(|a| match a {
-            PathAttribute::AsPath(segs) => Some(segs.clone()),
-            _ => None,
-        })
-        .unwrap_or_default();
-    let rewritten_as_path = if is_ebgp {
-        prepend_local_asn(&winner_as_path, local_asn)
-    } else {
-        winner_as_path
-    };
-    out.push(PathAttribute::AsPath(rewritten_as_path));
-
-    if !is_ebgp {
-        let lp = winner.local_pref().unwrap_or(100);
-        out.push(PathAttribute::LocalPref(lp));
-        if let Some(med) = winner.med() {
-            out.push(PathAttribute::MultiExitDisc(med));
-        }
-    }
-
-    for attr in &winner.path_attributes {
-        if let PathAttribute::Communities(c) = attr {
-            out.push(PathAttribute::Communities(c.clone()));
-        }
-    }
-
-    out.push(PathAttribute::MpReachNlri {
-        afi: AFI_IPV6,
-        safi: SAFI_UNICAST,
-        nexthop: local_next_hop.octets().to_vec(),
-        nlri: nlri_bytes,
-    });
-
-    out
+    build_outbound_attrs(
+        winner,
+        is_ebgp,
+        local_asn,
+        OutboundAfi::V6 { next_hop: local_next_hop, nlri_bytes },
+    )
 }
 
 /// Prepend `local_asn` to a winner's AS_PATH. If the leading
@@ -1676,6 +1623,49 @@ fn encode_v6_nlri(prefixes: &[Prefix6]) -> Vec<u8> {
     out
 }
 
+/// Synthetic v4 aggregate route injected into the local pseudo-RIB
+/// when at least one configured `aggregate-address` has a covered
+/// contributor. NEXT_HOP is the unspecified address — the
+/// outbound rewrite (`build_outbound_attrs`) replaces it with the
+/// peer-local NEXT_HOP_SELF.
+fn make_v4_aggregate_route(local_asn: u32, router_id: Ipv4Addr) -> StoredRoute {
+    StoredRoute::local_origin(
+        vec![
+            PathAttribute::Origin(Origin::Igp),
+            PathAttribute::AsPath(Vec::new()),
+            PathAttribute::NextHop(Ipv4Addr::UNSPECIFIED),
+            PathAttribute::LocalPref(100),
+            PathAttribute::AtomicAggregate,
+        ],
+        local_asn,
+        router_id,
+        OriginClass::Aggregate,
+    )
+}
+
+/// Synthetic v6 aggregate route. Same role as the v4 helper but
+/// rides in MP_REACH_NLRI (RFC 4760); the placeholder zeros for
+/// nexthop / nlri are overwritten on advertise.
+fn make_v6_aggregate_route(local_asn: u32, router_id: Ipv4Addr) -> StoredRoute {
+    StoredRoute::local_origin(
+        vec![
+            PathAttribute::Origin(Origin::Igp),
+            PathAttribute::AsPath(Vec::new()),
+            PathAttribute::LocalPref(100),
+            PathAttribute::AtomicAggregate,
+            PathAttribute::MpReachNlri {
+                afi: AFI_IPV6,
+                safi: SAFI_UNICAST,
+                nexthop: vec![0u8; 16],
+                nlri: Vec::new(),
+            },
+        ],
+        local_asn,
+        router_id,
+        OriginClass::Aggregate,
+    )
+}
+
 /// Per-peer cache of what's currently advertised in each peer's
 /// Adj-RIB-Out. The instance walks Loc-RIB on every change, diffs
 /// against this cache, and emits only the delta. Cleared on
@@ -1684,6 +1674,27 @@ fn encode_v6_nlri(prefixes: &[Prefix6]) -> Vec<u8> {
 struct AdvertisedPrefixes {
     v4: std::collections::HashSet<Prefix4>,
     v6: std::collections::HashSet<Prefix6>,
+}
+
+/// Per-peer state assembled once per `advertise_to_peer` call and
+/// threaded through the four phase methods. Owning the `tx` clone
+/// here keeps the phase signatures free of `&self`.
+struct AdvertiseCtx {
+    tx: mpsc::Sender<PeerControl>,
+    is_ebgp: bool,
+    export_policy: crate::policy::Policy,
+    local_asn: u32,
+    nh_v4: Option<Ipv4Addr>,
+    nh_v6: Option<Ipv6Addr>,
+}
+
+/// Loc-RIB winners filtered for outbound and bucketed by source
+/// peer. Each bucket becomes one UPDATE — its members share path
+/// attributes by construction (same source → same StoredRoute).
+#[derive(Default)]
+struct OutboundGroups {
+    v4: HashMap<PeerId, Vec<(Prefix4, StoredRoute)>>,
+    v6: HashMap<PeerId, Vec<(Prefix6, StoredRoute)>>,
 }
 
 /// Parse aggregate-address configs into typed prefixes. Unparseable

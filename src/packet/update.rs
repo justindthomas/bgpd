@@ -33,6 +33,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use crate::error::{AttributeErrorAction, ErrorCode, ParseError, UpdateMessageSubcode};
 use crate::packet::attrs::PathAttribute;
 use crate::packet::header::{Header, MessageType, HEADER_LEN, MAX_MESSAGE_LEN};
+use crate::packet::read_u16_be;
 
 /// A parsed UPDATE message. Holds the raw (Withdrawn / Path
 /// attributes / NLRI) decomposition; higher-level processing
@@ -116,7 +117,7 @@ impl Update {
                 action: AttributeErrorAction::SessionReset,
             });
         }
-        let withdrawn_len = u16::from_be_bytes([body[0], body[1]]) as usize;
+        let withdrawn_len = read_u16_be(&body[..2]) as usize;
         let mut p = 2;
         if body.len() - p < withdrawn_len {
             return Err(ParseError::Update {
@@ -140,7 +141,7 @@ impl Update {
                 action: AttributeErrorAction::SessionReset,
             });
         }
-        let attr_len = u16::from_be_bytes([body[p], body[p + 1]]) as usize;
+        let attr_len = read_u16_be(&body[p..p + 2]) as usize;
         p += 2;
         if body.len() - p < attr_len {
             return Err(ParseError::Update {

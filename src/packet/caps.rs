@@ -26,6 +26,7 @@
 //! ("Unsupported Capability") if needed.
 
 use crate::error::ParseError;
+use crate::packet::{read_u16_be, read_u32_be};
 
 pub const CAPABILITY_MULTIPROTOCOL: u8 = 1;
 pub const CAPABILITY_ROUTE_REFRESH: u8 = 2;
@@ -110,7 +111,7 @@ impl Capability {
                         value.len()
                     )));
                 }
-                let afi = u16::from_be_bytes([value[0], value[1]]);
+                let afi = read_u16_be(value);
                 // value[2] is the Reserved byte — ignored on receive.
                 let safi = value[3];
                 Capability::Multiprotocol { afi, safi }
@@ -131,9 +132,7 @@ impl Capability {
                         value.len()
                     )));
                 }
-                Capability::FourOctetAsn(u32::from_be_bytes([
-                    value[0], value[1], value[2], value[3],
-                ]))
+                Capability::FourOctetAsn(read_u32_be(value))
             }
             _ => Capability::Unknown {
                 code,

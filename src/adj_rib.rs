@@ -145,62 +145,54 @@ impl StoredRoute {
     }
 
     pub fn find_origin(&self) -> Option<crate::packet::attrs::Origin> {
-        for attr in &self.path_attributes {
-            if let PathAttribute::Origin(o) = attr {
-                return Some(*o);
-            }
-        }
-        None
+        self.path_attributes.iter().find_map(|a| match a {
+            PathAttribute::Origin(o) => Some(*o),
+            _ => None,
+        })
     }
 
     /// Sum of ASNs across every AS_SEQUENCE segment plus 1 per
     /// AS_SET segment (RFC 4271 §9.1.2.2's "shortest AS_PATH"
     /// counts a set as 1). Returns 0 if no AS_PATH is present.
     pub fn as_path_length(&self) -> usize {
-        for attr in &self.path_attributes {
-            if let PathAttribute::AsPath(segments) = attr {
-                let mut total = 0usize;
-                for seg in segments {
-                    match seg.seg_type {
-                        crate::packet::attrs::AsPathSegmentType::AsSequence => {
-                            total += seg.asns.len();
-                        }
-                        crate::packet::attrs::AsPathSegmentType::AsSet => {
-                            total += 1;
-                        }
-                    }
-                }
-                return total;
-            }
-        }
-        0
+        use crate::packet::attrs::AsPathSegmentType::{AsSequence, AsSet};
+        self.path_attributes
+            .iter()
+            .find_map(|a| match a {
+                PathAttribute::AsPath(segments) => Some(segments),
+                _ => None,
+            })
+            .map(|segments| {
+                segments
+                    .iter()
+                    .map(|seg| match seg.seg_type {
+                        AsSequence => seg.asns.len(),
+                        AsSet => 1,
+                    })
+                    .sum()
+            })
+            .unwrap_or(0)
     }
 
     pub fn local_pref(&self) -> Option<u32> {
-        for attr in &self.path_attributes {
-            if let PathAttribute::LocalPref(lp) = attr {
-                return Some(*lp);
-            }
-        }
-        None
+        self.path_attributes.iter().find_map(|a| match a {
+            PathAttribute::LocalPref(lp) => Some(*lp),
+            _ => None,
+        })
     }
 
     pub fn med(&self) -> Option<u32> {
-        for attr in &self.path_attributes {
-            if let PathAttribute::MultiExitDisc(med) = attr {
-                return Some(*med);
-            }
-        }
-        None
+        self.path_attributes.iter().find_map(|a| match a {
+            PathAttribute::MultiExitDisc(med) => Some(*med),
+            _ => None,
+        })
     }
 
     pub fn next_hop_v4(&self) -> Option<std::net::Ipv4Addr> {
-        for attr in &self.path_attributes {
-            if let PathAttribute::NextHop(nh) = attr {
-                return Some(*nh);
-            }
-        }
-        None
+        self.path_attributes.iter().find_map(|a| match a {
+            PathAttribute::NextHop(nh) => Some(*nh),
+            _ => None,
+        })
     }
 
     /// Extract the IPv6 next-hop from an MP_REACH_NLRI attribute,
@@ -208,16 +200,16 @@ impl StoredRoute {
     /// next-hop (RFC 2545) lives in the second 16 bytes when
     /// present and is not used by v1.
     pub fn next_hop_v6(&self) -> Option<std::net::Ipv6Addr> {
-        for attr in &self.path_attributes {
-            if let PathAttribute::MpReachNlri { afi, nexthop, .. } = attr {
-                if *afi == crate::packet::caps::AFI_IPV6 && nexthop.len() >= 16 {
-                    let mut octets = [0u8; 16];
-                    octets.copy_from_slice(&nexthop[..16]);
-                    return Some(std::net::Ipv6Addr::from(octets));
-                }
+        self.path_attributes.iter().find_map(|a| match a {
+            PathAttribute::MpReachNlri { afi, nexthop, .. }
+                if *afi == crate::packet::caps::AFI_IPV6 && nexthop.len() >= 16 =>
+            {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&nexthop[..16]);
+                Some(std::net::Ipv6Addr::from(octets))
             }
-        }
-        None
+            _ => None,
+        })
     }
 }
 

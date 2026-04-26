@@ -22,12 +22,11 @@
 //! Internet from a misconfigured upstream", which the
 //! AcceptAll/DenyAll/PrefixFilter trio covers.
 
-use crate::adj_rib::StoredRoute;
 use crate::packet::update::{Prefix4, Prefix6};
 
 /// A single import/export policy. Same shape for both directions
-/// — the difference is just which side calls [`apply_v4`] /
-/// [`apply_v6`].
+/// — the difference is just which side calls [`permits_v4`] /
+/// [`permits_v6`].
 #[derive(Debug, Clone)]
 pub enum Policy {
     AcceptAll,
@@ -49,34 +48,23 @@ impl Default for Policy {
 }
 
 impl Policy {
-    /// Apply this policy to a single v4 route. Returns the route
-    /// (possibly unchanged) if it's permitted, or `None` if the
-    /// policy filters it out.
-    pub fn apply_v4(&self, prefix: &Prefix4, route: StoredRoute) -> Option<StoredRoute> {
+    /// Whether this policy permits a v4 prefix. v1 has no
+    /// set-actions, so the route itself is never modified — the
+    /// caller can keep ownership and only clone on the accept
+    /// branch.
+    pub fn permits_v4(&self, prefix: &Prefix4) -> bool {
         match self {
-            Policy::AcceptAll => Some(route),
-            Policy::DenyAll => None,
-            Policy::PrefixFilter { v4, .. } => {
-                if v4.iter().any(|allowed| allowed == prefix) {
-                    Some(route)
-                } else {
-                    None
-                }
-            }
+            Policy::AcceptAll => true,
+            Policy::DenyAll => false,
+            Policy::PrefixFilter { v4, .. } => v4.iter().any(|allowed| allowed == prefix),
         }
     }
 
-    pub fn apply_v6(&self, prefix: &Prefix6, route: StoredRoute) -> Option<StoredRoute> {
+    pub fn permits_v6(&self, prefix: &Prefix6) -> bool {
         match self {
-            Policy::AcceptAll => Some(route),
-            Policy::DenyAll => None,
-            Policy::PrefixFilter { v6, .. } => {
-                if v6.iter().any(|allowed| allowed == prefix) {
-                    Some(route)
-                } else {
-                    None
-                }
-            }
+            Policy::AcceptAll => true,
+            Policy::DenyAll => false,
+            Policy::PrefixFilter { v6, .. } => v6.iter().any(|allowed| allowed == prefix),
         }
     }
 }
@@ -112,19 +100,7 @@ impl PeerPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packet::attrs::{Origin, PathAttribute};
-    use std::net::{IpAddr, Ipv4Addr};
-
-    fn route() -> StoredRoute {
-        StoredRoute::new(
-            vec![PathAttribute::Origin(Origin::Igp)],
-            1,
-            65001,
-            65000,
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
-            Ipv4Addr::new(10, 0, 0, 1),
-        )
-    }
+    use std::net::Ipv4Addr;
 
     fn p4(a: u8, b: u8, c: u8, d: u8, len: u8) -> Prefix4 {
         Prefix4 {
@@ -135,27 +111,22 @@ mod tests {
 
     #[test]
     fn accept_all_passes_through() {
-        let p = p4(192, 0, 2, 0, 24);
-        let result = Policy::AcceptAll.apply_v4(&p, route());
-        assert!(result.is_some());
+        assert!(Policy::AcceptAll.permits_v4(&p4(192, 0, 2, 0, 24)));
     }
 
     #[test]
     fn deny_all_drops_everything() {
-        let p = p4(192, 0, 2, 0, 24);
-        let result = Policy::DenyAll.apply_v4(&p, route());
-        assert!(result.is_none());
+        assert!(!Policy::DenyAll.permits_v4(&p4(192, 0, 2, 0, 24)));
     }
 
     #[test]
     fn prefix_filter_admits_only_listed_v4() {
-        let allowed = vec![p4(192, 0, 2, 0, 24), p4(198, 51, 100, 0, 24)];
         let policy = Policy::PrefixFilter {
-            v4: allowed,
+            v4: vec![p4(192, 0, 2, 0, 24), p4(198, 51, 100, 0, 24)],
             v6: Vec::new(),
         };
-        assert!(policy.apply_v4(&p4(192, 0, 2, 0, 24), route()).is_some());
-        assert!(policy.apply_v4(&p4(10, 0, 0, 0, 8), route()).is_none());
+        assert!(policy.permits_v4(&p4(192, 0, 2, 0, 24)));
+        assert!(!policy.permits_v4(&p4(10, 0, 0, 0, 8)));
     }
 
     #[test]
