@@ -422,21 +422,30 @@ impl BgpInstance {
 
         // Build per-peer policy from config, falling back to
         // RFC 8212 defaults (deny-all for eBGP, accept-all for
-        // iBGP) when no explicit policy is configured.
+        // iBGP) when no explicit policy is configured. Names that
+        // aren't keywords are looked up against the daemon's
+        // route_maps; an unknown name logs a warning and falls
+        // back to the default.
         let is_ebgp = cfg.remote_asn != self.config.local_asn;
         let default_policy = if is_ebgp {
             crate::policy::PeerPolicy::ebgp_default_deny()
         } else {
             crate::policy::PeerPolicy::ibgp_default()
         };
-        let import = match &cfg.import_policy {
-            Some(pc) => pc.to_policy().unwrap_or(default_policy.import.clone()),
-            None => default_policy.import.clone(),
-        };
-        let export = match &cfg.export_policy {
-            Some(pc) => pc.to_policy().unwrap_or(default_policy.export.clone()),
-            None => default_policy.export.clone(),
-        };
+        let import = resolve_peer_policy(
+            cfg.import_policy.as_deref(),
+            &self.config.route_maps,
+            &default_policy.import,
+            cfg.address,
+            "import",
+        );
+        let export = resolve_peer_policy(
+            cfg.export_policy.as_deref(),
+            &self.config.route_maps,
+            &default_policy.export,
+            cfg.address,
+            "export",
+        );
         let policy = crate::policy::PeerPolicy { import, export };
         self.peer_policies.insert(peer_id, policy);
 
@@ -752,31 +761,46 @@ impl BgpInstance {
             } else {
                 crate::policy::PeerPolicy::ibgp_default()
             };
-            let import = match &new_p.import_policy {
-                Some(pc) => pc.to_policy().unwrap_or_else(|_| default_policy.import.clone()),
-                None => default_policy.import.clone(),
-            };
-            let export = match &new_p.export_policy {
-                Some(pc) => pc.to_policy().unwrap_or_else(|_| default_policy.export.clone()),
-                None => default_policy.export.clone(),
-            };
+            let import = resolve_peer_policy(
+                new_p.import_policy.as_deref(),
+                &new_config.route_maps,
+                &default_policy.import,
+                new_p.address,
+                "import",
+            );
+            let export = resolve_peer_policy(
+                new_p.export_policy.as_deref(),
+                &new_config.route_maps,
+                &default_policy.export,
+                new_p.address,
+                "export",
+            );
             let new_policy = crate::policy::PeerPolicy { import, export };
 
-            // Unconditionally update + re-filter. The policy types
-            // don't cheaply compare (PrefixList holds a Vec), and
+            // Unconditionally update + re-filter. Policy types
+            // don't cheaply compare (route-maps wrap statements);
             // re-filtering an already-matching set is idempotent
-            // + cheap.
+            // and cheap.
             self.peer_policies.insert(pid, new_policy.clone());
 
             let mut snap = self.snapshot.lock().await;
             if let Some(peer) = snap.peers.iter_mut().find(|p| p.id == pid) {
                 let before = peer.adj_rib_in.len();
-                peer.adj_rib_in
-                    .v4_unicast
-                    .retain(|prefix, _| new_policy.import.permits_v4(prefix));
-                peer.adj_rib_in
-                    .v6_unicast
-                    .retain(|prefix, _| new_policy.import.permits_v6(prefix));
+                let import = &new_policy.import;
+                peer.adj_rib_in.v4_unicast.retain(|prefix, stored| {
+                    import.permits_v4(
+                        prefix,
+                        &stored.path_attributes,
+                        crate::policy::source_for_route(stored),
+                    )
+                });
+                peer.adj_rib_in.v6_unicast.retain(|prefix, stored| {
+                    import.permits_v6(
+                        prefix,
+                        &stored.path_attributes,
+                        crate::policy::source_for_route(stored),
+                    )
+                });
                 let after = peer.adj_rib_in.len();
                 if before != after {
                     tracing::info!(
@@ -994,6 +1018,12 @@ impl BgpInstance {
             .get(&peer_id)
             .map(|pp| pp.export.clone())
             .unwrap_or_default();
+        let redistribute = self
+            .config
+            .peers
+            .get((peer_id - 1) as usize)
+            .map(|p| build_redistribute_filter(p, &self.config.route_maps))
+            .unwrap_or_default();
 
         // Local TCP address feeds next-hop-self.
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -1014,6 +1044,7 @@ impl BgpInstance {
             tx,
             is_ebgp,
             export_policy,
+            redistribute,
             local_asn: self.config.local_asn,
             nh_v4,
             nh_v6,
@@ -1057,7 +1088,19 @@ impl BgpInstance {
                 if entry.winner.peer_id == peer_id {
                     continue;
                 }
-                if !ctx.export_policy.permits_v4(prefix) {
+                let source = crate::policy::source_for_route(&entry.winner);
+                if !ctx.export_policy.permits_v4(
+                    prefix,
+                    &entry.winner.path_attributes,
+                    source,
+                ) {
+                    continue;
+                }
+                if !ctx.redistribute.permits(
+                    entry.winner.origin_class,
+                    ribd_proto::Prefix::v4(prefix.addr, prefix.len),
+                    &entry.winner.path_attributes,
+                ) {
                     continue;
                 }
                 if suppressed_v4.iter().any(|agg| is_more_specific_v4(agg, prefix)) {
@@ -1076,7 +1119,19 @@ impl BgpInstance {
                 if entry.winner.peer_id == peer_id {
                     continue;
                 }
-                if !ctx.export_policy.permits_v6(prefix) {
+                let source = crate::policy::source_for_route(&entry.winner);
+                if !ctx.export_policy.permits_v6(
+                    prefix,
+                    &entry.winner.path_attributes,
+                    source,
+                ) {
+                    continue;
+                }
+                if !ctx.redistribute.permits(
+                    entry.winner.origin_class,
+                    ribd_proto::Prefix::v6(prefix.addr, prefix.len),
+                    &entry.winner.path_attributes,
+                ) {
                     continue;
                 }
                 if suppressed_v6.iter().any(|agg| is_more_specific_v6(agg, prefix)) {
@@ -1358,8 +1413,13 @@ fn apply_update_to_peer(
             peer.address,
             ipv4_or_unspec(peer.address),
         );
+        let import_source = crate::policy::source_for_route(&stored);
         for prefix in &update.nlri_v4 {
-            if import_policy.permits_v4(prefix) {
+            if import_policy.permits_v4(
+                prefix,
+                &stored.path_attributes,
+                import_source,
+            ) {
                 peer.adj_rib_in.insert_v4(*prefix, stored.clone());
             }
         }
@@ -1398,8 +1458,13 @@ fn apply_update_to_peer(
             peer.address,
             ipv4_or_unspec(peer.address),
         );
+        let import_source = crate::policy::source_for_route(&stored);
         for prefix in &v6_announce {
-            if import_policy.permits_v6(prefix) {
+            if import_policy.permits_v6(
+                prefix,
+                &stored.path_attributes,
+                import_source,
+            ) {
                 peer.adj_rib_in.insert_v6(*prefix, stored.clone());
             }
         }
@@ -1683,9 +1748,195 @@ struct AdvertiseCtx {
     tx: mpsc::Sender<PeerControl>,
     is_ebgp: bool,
     export_policy: crate::policy::Policy,
+    redistribute: RedistributeFilter,
     local_asn: u32,
     nh_v4: Option<Ipv4Addr>,
     nh_v6: Option<Ipv6Addr>,
+}
+
+/// Per-peer redistribute opt-ins. A locally-originated route from
+/// ribd is advertised to a peer only if a matching protocol entry
+/// is present (and its route-map, if any, permits the prefix).
+/// Routes from `announced_prefixes` (`OriginClass::Static`) and
+/// synthetic aggregates (`OriginClass::Aggregate`) bypass this
+/// filter — those are always offered to every peer (subject to
+/// export-policy / summary-only suppression).
+#[derive(Debug, Default, Clone)]
+struct RedistributeFilter {
+    connected: ProtocolFilter,
+    ospf: ProtocolFilter,
+    static_: ProtocolFilter,
+}
+
+/// One protocol's per-peer status: `NotPermitted` (the peer has
+/// no `redistribute: protocol: <p>` entry), `Permit` (entry with
+/// no route-map — accept all), or `Filtered(map)` (entry with a
+/// route-map that decides per-prefix).
+#[derive(Debug, Default, Clone)]
+enum ProtocolFilter {
+    #[default]
+    NotPermitted,
+    Permit,
+    Filtered(crate::config::BgpRouteMap),
+}
+
+impl RedistributeFilter {
+    fn permits(
+        &self,
+        oc: OriginClass,
+        prefix: ribd_proto::Prefix,
+        path_attrs: &[PathAttribute],
+    ) -> bool {
+        use ribd_proto::Source;
+        let pf = match oc {
+            OriginClass::PeerLearned
+            | OriginClass::Static
+            | OriginClass::Aggregate => return true,
+            OriginClass::Connected => &self.connected,
+            OriginClass::Redistribute(Source::Static) => &self.static_,
+            OriginClass::Redistribute(
+                Source::OspfIntra
+                | Source::OspfInter
+                | Source::OspfExt1
+                | Source::OspfExt2
+                | Source::Ospf6Intra
+                | Source::Ospf6Inter
+                | Source::Ospf6Ext1
+                | Source::Ospf6Ext2,
+            ) => &self.ospf,
+            OriginClass::Redistribute(_) => return false,
+        };
+        match pf {
+            ProtocolFilter::NotPermitted => false,
+            ProtocolFilter::Permit => true,
+            ProtocolFilter::Filtered(map) => {
+                evaluate_route_map(map, prefix, source_for_origin(oc), path_attrs)
+            }
+        }
+    }
+}
+
+/// Project an `OriginClass` to the ribd `Source` used by a
+/// route-map's universal `source:` clause. Only called on
+/// origin classes that pass the per-protocol filter — peer-
+/// learned, static (announced), and aggregate routes never
+/// reach a route-map evaluation.
+fn source_for_origin(oc: OriginClass) -> ribd_proto::Source {
+    use ribd_proto::Source;
+    match oc {
+        OriginClass::Connected => Source::Connected,
+        OriginClass::Redistribute(s) => s,
+        // Static / Aggregate / PeerLearned shouldn't reach here.
+        _ => Source::Static,
+    }
+}
+
+/// Resolve an `import_policy:` / `export_policy:` YAML string to
+/// a runtime `Policy`. Reserved keywords (`accept-all`/`deny-all`)
+/// shortcut to the keyword variants; any other name is looked up
+/// in `route_maps`. Unknown name falls back to `default` with a
+/// warning so an operator typo doesn't silently change behavior.
+fn resolve_peer_policy(
+    name: Option<&str>,
+    route_maps: &std::collections::HashMap<String, crate::config::BgpRouteMap>,
+    default: &crate::policy::Policy,
+    peer: std::net::IpAddr,
+    direction: &'static str,
+) -> crate::policy::Policy {
+    let Some(name) = name else {
+        return default.clone();
+    };
+    match crate::policy::resolve_policy_name(name, route_maps) {
+        Some(p) => p,
+        None => {
+            tracing::warn!(
+                peer = %peer,
+                direction,
+                policy = %name,
+                "unknown policy / route-map name; falling back to default"
+            );
+            default.clone()
+        }
+    }
+}
+
+/// Build a `RedistributeFilter` for one peer by consulting its
+/// rules and resolving any referenced route-maps from the daemon-
+/// level `route_maps` table. A rule that references an unknown
+/// route-map name falls back to `NotPermitted` with a warning
+/// (operator typo shouldn't silently leak routes).
+fn build_redistribute_filter(
+    peer: &crate::config::BgpPeerConfig,
+    maps: &std::collections::HashMap<String, crate::config::BgpRouteMap>,
+) -> RedistributeFilter {
+    use crate::config::RedistributeProtocol;
+    let mut out = RedistributeFilter::default();
+    for rule in &peer.redistribute {
+        let resolved = match &rule.route_map {
+            None => ProtocolFilter::Permit,
+            Some(name) => match maps.get(name) {
+                Some(map) => ProtocolFilter::Filtered(map.clone()),
+                None => {
+                    tracing::warn!(
+                        peer = %peer.address,
+                        protocol = ?rule.protocol,
+                        route_map = %name,
+                        "redistribute references unknown route-map; treating as deny"
+                    );
+                    ProtocolFilter::NotPermitted
+                }
+            },
+        };
+        match rule.protocol {
+            RedistributeProtocol::Connected => out.connected = resolved,
+            RedistributeProtocol::Ospf => out.ospf = resolved,
+            RedistributeProtocol::Static => out.static_ = resolved,
+        }
+    }
+    out
+}
+
+/// Walk the statements of a compiled route-map and return whether
+/// the route is permitted. Each statement's universal clauses
+/// evaluate against the prefix/source context; the BGP-specific
+/// extras (community, as_path_contains, local_pref) evaluate
+/// against the route's path attributes. Both halves must hold for
+/// a statement to match. The no-statement-matched case denies,
+/// matching FRR/Cisco.
+fn evaluate_route_map(
+    map: &crate::config::BgpRouteMap,
+    prefix: ribd_proto::Prefix,
+    source: ribd_proto::Source,
+    path_attrs: &[PathAttribute],
+) -> bool {
+    let ctx = RedistributeMatchCtx { prefix, source };
+    for stmt in &map.statements {
+        if !stmt.match_.evaluate_universal(&ctx) {
+            continue;
+        }
+        if !crate::route_map::evaluate_bgp_match(&stmt.match_.extra, path_attrs) {
+            continue;
+        }
+        return matches!(stmt.action, ribd_routemap::Action::Permit);
+    }
+    false
+}
+
+/// Adapter that exposes a redistribute candidate to the universal
+/// route-map evaluator. Carries only the fields bgpd has access to
+/// at advertise time for a locally-originated prefix.
+struct RedistributeMatchCtx {
+    prefix: ribd_proto::Prefix,
+    source: ribd_proto::Source,
+}
+
+impl ribd_routemap::MatchContext for RedistributeMatchCtx {
+    fn prefix(&self) -> ribd_proto::Prefix {
+        self.prefix
+    }
+    fn source(&self) -> ribd_proto::Source {
+        self.source
+    }
 }
 
 /// Loc-RIB winners filtered for outbound and bucketed by source
@@ -1879,6 +2130,148 @@ mod tests {
                 len: 24
             }
         ));
+    }
+
+    fn p(prefix: &str) -> ribd_proto::Prefix {
+        let net: ipnet::IpNet = prefix.parse().unwrap();
+        match net {
+            ipnet::IpNet::V4(v) => ribd_proto::Prefix::v4(v.network(), v.prefix_len()),
+            ipnet::IpNet::V6(v) => ribd_proto::Prefix::v6(v.network(), v.prefix_len()),
+        }
+    }
+
+    #[test]
+    fn redistribute_filter_default_denies_redistribute_classes() {
+        use ribd_proto::Source;
+        let none = RedistributeFilter::default();
+        let any = p("10.0.0.0/8");
+        // Bypass classes — always permitted.
+        assert!(none.permits(OriginClass::PeerLearned, any, &[]));
+        assert!(none.permits(OriginClass::Static, any, &[]));
+        assert!(none.permits(OriginClass::Aggregate, any, &[]));
+        // Redistribute classes — denied with an empty filter.
+        assert!(!none.permits(OriginClass::Connected, any, &[]));
+        assert!(!none.permits(OriginClass::Redistribute(Source::Static), any, &[]));
+        assert!(!none.permits(OriginClass::Redistribute(Source::OspfIntra), any, &[]));
+        assert!(!none.permits(OriginClass::Redistribute(Source::Ospf6Ext1), any, &[]));
+    }
+
+    #[test]
+    fn redistribute_filter_permit_without_map_admits_protocol() {
+        use ribd_proto::Source;
+        let f = RedistributeFilter {
+            connected: ProtocolFilter::Permit,
+            ospf: ProtocolFilter::NotPermitted,
+            static_: ProtocolFilter::NotPermitted,
+        };
+        let pfx = p("10.0.0.0/8");
+        assert!(f.permits(OriginClass::Connected, pfx, &[]));
+        assert!(!f.permits(OriginClass::Redistribute(Source::OspfIntra), pfx, &[]));
+        assert!(!f.permits(OriginClass::Redistribute(Source::Static), pfx, &[]));
+    }
+
+    fn compile_map(yaml: &str) -> crate::config::BgpRouteMap {
+        let parsed: ribd_routemap::RouteMapYaml<
+            crate::route_map::BgpMatchYaml,
+            crate::route_map::BgpSetYaml,
+        > = serde_yaml::from_str(yaml).unwrap();
+        crate::route_map::compile(parsed).unwrap()
+    }
+
+    #[test]
+    fn redistribute_filter_with_route_map_filters_by_prefix() {
+        use ribd_proto::Source;
+        let map = compile_map(
+            r#"
+name: only-23
+statements:
+  - seq: 10
+    action: permit
+    match:
+      prefix_list: ["23.177.24.0/24"]
+  - seq: 20
+    action: deny
+"#,
+        );
+        let f = RedistributeFilter {
+            connected: ProtocolFilter::Filtered(map),
+            ospf: ProtocolFilter::NotPermitted,
+            static_: ProtocolFilter::NotPermitted,
+        };
+        // The map permits 23.177.24.0/24 but denies everything else.
+        assert!(f.permits(OriginClass::Connected, p("23.177.24.0/24"), &[]));
+        assert!(!f.permits(OriginClass::Connected, p("10.0.0.0/8"), &[]));
+        // OSPF still not permitted regardless.
+        assert!(!f.permits(
+            OriginClass::Redistribute(Source::OspfIntra),
+            p("23.177.24.0/24"),
+            &[],
+        ));
+    }
+
+    #[test]
+    fn redistribute_filter_empty_map_denies_all() {
+        // Map with zero statements should deny anything that
+        // routes through it (FRR/Cisco semantics — referenced
+        // empty map reflects intent to filter).
+        let map = crate::config::BgpRouteMap {
+            name: "empty".into(),
+            statements: Vec::new(),
+        };
+        let f = RedistributeFilter {
+            connected: ProtocolFilter::Filtered(map),
+            ospf: ProtocolFilter::NotPermitted,
+            static_: ProtocolFilter::NotPermitted,
+        };
+        assert!(!f.permits(OriginClass::Connected, p("23.177.24.0/24"), &[]));
+        assert!(!f.permits(OriginClass::Connected, p("10.0.0.0/8"), &[]));
+    }
+
+    #[test]
+    fn redistribute_filter_route_map_uses_bgp_match_extras() {
+        // Route-map permits only when AS_PATH contains 65500 AND
+        // a community 65000:100 is present. Universal prefix list
+        // also constrains to 23.0.0.0/8.
+        let map = compile_map(
+            r#"
+name: bgp-extras-test
+statements:
+  - seq: 10
+    action: permit
+    match:
+      prefix_list: ["23.0.0.0/8"]
+      as_path_contains: 65500
+      community: ["65000:100"]
+  - seq: 20
+    action: deny
+"#,
+        );
+        let f = RedistributeFilter {
+            connected: ProtocolFilter::Filtered(map),
+            ospf: ProtocolFilter::NotPermitted,
+            static_: ProtocolFilter::NotPermitted,
+        };
+        let pfx = p("23.0.0.0/8");
+        // Missing both extras → deny.
+        assert!(!f.permits(OriginClass::Connected, pfx, &[]));
+        // Only AS_PATH match → still missing community → deny.
+        let only_as_path = vec![PathAttribute::AsPath(vec![AsPathSegment {
+            seg_type: AsPathSegmentType::AsSequence,
+            asns: vec![65500],
+        }])];
+        assert!(!f.permits(OriginClass::Connected, pfx, &only_as_path));
+        // Both → permit.
+        let comm: u32 = (65000u32 << 16) | 100;
+        let both = vec![
+            PathAttribute::AsPath(vec![AsPathSegment {
+                seg_type: AsPathSegmentType::AsSequence,
+                asns: vec![65500, 65501],
+            }]),
+            PathAttribute::Communities(vec![comm]),
+        ];
+        assert!(f.permits(OriginClass::Connected, pfx, &both));
+        // Right extras but wrong prefix — universal denies first.
+        assert!(!f.permits(OriginClass::Connected, p("10.0.0.0/8"), &both));
     }
 
     #[test]

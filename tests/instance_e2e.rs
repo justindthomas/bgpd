@@ -251,18 +251,14 @@ async fn instance_e2e_pushes_received_route_to_ribd() {
             address_families: Vec::new(),
             import_policy: None,
             export_policy: None,
+            redistribute: Vec::new(),
         }],
         announced_prefixes_v4: Vec::new(),
         announced_prefixes_v6: Vec::new(),
-        redistribute_connected_v4: false,
-        redistribute_connected_v6: false,
-        redistribute_ospf_v4: false,
-        redistribute_ospf_v6: false,
-        redistribute_static_v4: false,
-        redistribute_static_v6: false,
         aggregates_v4: Vec::new(),
         aggregates_v6: Vec::new(),
         listen_address: None,
+        route_maps: std::collections::HashMap::new(),
     };
 
     // 4. Build the instance against the fake ribd, spawn

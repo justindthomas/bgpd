@@ -9,6 +9,7 @@ authors = ["Justin Thomas"]
 [dependencies]
 ribd-proto = { git = "https://github.com/justindthomas/ribd" }
 ribd-client = { git = "https://github.com/justindthomas/ribd" }
+ribd-routemap = { git = "https://github.com/justindthomas/ribd" }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -46,6 +47,7 @@ path = "src/main.rs"
 [patch."https://github.com/justindthomas/ribd"]
 ribd-proto = { path = "../ribd/ribd-proto" }
 ribd-client = { path = "../ribd/ribd-client" }
+ribd-routemap = { path = "../ribd/ribd-routemap" }
 
 [patch."https://github.com/justindthomas/vcl-rs"]
 vcl-rs = { path = "../vcl-rs" }

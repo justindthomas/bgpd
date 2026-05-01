@@ -42,9 +42,12 @@ pub struct LocalOrigin {
 
 impl LocalOrigin {
     /// Build the local-origin set for the given config. Queries
-    /// ribd for its `Source::Connected` routes if either
-    /// `redistribute_connected_v4` or `redistribute_connected_v6`
-    /// is set; static `announced_prefixes_*` are always merged in.
+    /// ribd for installed routes if *any* peer has a redistribute
+    /// entry; static `announced_prefixes_*` are always merged in.
+    /// Per-peer redistribute filtering happens at advertise time
+    /// (see `BgpInstance::collect_outbound_routes`) — this set is
+    /// the union across peers so best-path competition sees every
+    /// candidate route uniformly.
     pub async fn build(
         config: &BgpDaemonConfig,
         rib: &mut RibConnection,
@@ -63,15 +66,15 @@ impl LocalOrigin {
             origin_v6.entry(*p).or_insert(OriginClass::Static);
         }
 
-        // Query ribd for all installed routes if any
-        // redistribute flag is set. A single query covers all
-        // sources; we filter locally.
-        let need_query = config.redistribute_connected_v4
-            || config.redistribute_connected_v6
-            || config.redistribute_ospf_v4
-            || config.redistribute_ospf_v6
-            || config.redistribute_static_v4
-            || config.redistribute_static_v6;
+        // Query ribd for all installed routes if any peer has any
+        // redistribute entry. The union determines what gets
+        // ingested into the local pseudo-RIB; per-peer filtering
+        // at advertise time decides who actually receives each
+        // route.
+        let any_connected = config.peers.iter().any(|p| p.redistribute_connected());
+        let any_ospf = config.peers.iter().any(|p| p.redistribute_ospf());
+        let any_static = config.peers.iter().any(|p| p.redistribute_static());
+        let need_query = any_connected || any_ospf || any_static;
         if need_query {
             let reply = rib
                 .query(QueryRequest::InstalledRoutes)
@@ -84,31 +87,32 @@ impl LocalOrigin {
                 }
             };
             for r in routes {
-                let dominated_v4 = match r.source {
-                    RibSource::Connected => config.redistribute_connected_v4,
-                    RibSource::Static => config.redistribute_static_v4,
+                let wanted = match r.source {
+                    RibSource::Connected => any_connected,
+                    RibSource::Static => any_static,
                     RibSource::OspfIntra
                     | RibSource::OspfInter
                     | RibSource::OspfExt1
-                    | RibSource::OspfExt2 => config.redistribute_ospf_v4,
-                    _ => false,
-                };
-                let dominated_v6 = match r.source {
-                    RibSource::Connected => config.redistribute_connected_v6,
-                    RibSource::Static => config.redistribute_static_v6,
-                    RibSource::Ospf6Intra
+                    | RibSource::OspfExt2
+                    | RibSource::Ospf6Intra
                     | RibSource::Ospf6Inter
                     | RibSource::Ospf6Ext1
-                    | RibSource::Ospf6Ext2 => config.redistribute_ospf_v6,
+                    | RibSource::Ospf6Ext2 => any_ospf,
                     _ => false,
                 };
+                if !wanted {
+                    continue;
+                }
+                // RibSource::Static maps to OriginClass::Redistribute(Static)
+                // — distinct from OriginClass::Static (which is reserved for
+                // announced_prefixes) so the per-peer redistribute filter can
+                // tell them apart.
                 let oc = match r.source {
                     RibSource::Connected => OriginClass::Connected,
-                    RibSource::Static => OriginClass::Static,
                     src => OriginClass::Redistribute(src),
                 };
                 match r.prefix.af {
-                    Af::V4 if dominated_v4 => {
+                    Af::V4 => {
                         let mut octets = [0u8; 4];
                         octets.copy_from_slice(&r.prefix.addr[..4]);
                         let pfx = Prefix4 {
@@ -118,7 +122,7 @@ impl LocalOrigin {
                         v4.insert(pfx);
                         origin_v4.entry(pfx).or_insert(oc);
                     }
-                    Af::V6 if dominated_v6 => {
+                    Af::V6 => {
                         let pfx = Prefix6 {
                             addr: std::net::Ipv6Addr::from(r.prefix.addr),
                             len: r.prefix.len,
@@ -126,7 +130,6 @@ impl LocalOrigin {
                         v6.insert(pfx);
                         origin_v6.entry(pfx).or_insert(oc);
                     }
-                    _ => {}
                 }
             }
         }
