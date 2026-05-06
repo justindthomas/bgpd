@@ -73,6 +73,18 @@ pub struct BgpDaemonConfig {
     /// routes. v1: bgpd uses universal-only (`NoExtras`) clauses;
     /// task #7 adds bgpd-specific match/set extras.
     pub route_maps: HashMap<String, BgpRouteMap>,
+    /// VRF identity for routes pushed to ribd. `0` is the default
+    /// VRF; non-zero means this daemon was started with `--vrf
+    /// <name>` and tags every Route with the VRF's `table_id_v4` /
+    /// `table_id_v6` so ribd programs them in the right FIB.
+    /// Loader populates these from the top-level `vrfs:` block when
+    /// `--vrf` is set; main.rs is the sole call site that picks one.
+    pub table_id_v4: u32,
+    pub table_id_v6: u32,
+    /// Operator-facing VRF name (matches `--vrf` arg). `None` for
+    /// the default VRF. Surfaces in `bgpd query summary` so an
+    /// operator can tell which instance they're talking to.
+    pub vrf_name: Option<String>,
 }
 
 /// Configuration for one aggregate-address.
@@ -200,6 +212,35 @@ pub enum ConfigError {
     RouteMapCompile(String, crate::route_map::RouteMapCompileError),
     #[error("duplicate route-map name: {0}")]
     DuplicateRouteMapName(String),
+    /// `--vrf <name>` was set but no `bgp.vrfs[]` entry matches.
+    #[error("--vrf {0}: no matching bgp.vrfs[] block in config")]
+    UnknownVrf(String),
+    /// `bgp.vrfs[].name` references a VRF that isn't declared in
+    /// the top-level `vrfs:` block.
+    #[error("--vrf {0}: VRF not declared in router.yaml's vrfs: block")]
+    UndeclaredVrf(String),
+    /// VRF declaration is malformed (e.g. table_id 0).
+    #[error("invalid VRF: {0}")]
+    InvalidVrf(String),
+}
+
+/// Compile the top-level `route_maps:` YAML block into a name →
+/// compiled-map map. Shared between the default-VRF loader and
+/// the per-VRF loader so route-maps stay router-wide.
+fn compile_route_maps(
+    yaml: Vec<RouteMapYaml<BgpMatchYaml, BgpSetYaml>>,
+) -> Result<HashMap<String, BgpRouteMap>, ConfigError> {
+    let mut maps: HashMap<String, BgpRouteMap> = HashMap::new();
+    for m in yaml {
+        let name = m.name.clone();
+        if maps.contains_key(&name) {
+            return Err(ConfigError::DuplicateRouteMapName(name));
+        }
+        let compiled = crate::route_map::compile(m)
+            .map_err(|e| ConfigError::RouteMapCompile(name.clone(), e))?;
+        maps.insert(name, compiled);
+    }
+    Ok(maps)
 }
 
 /// On-disk shape of the `bgp:` block in the YAML config file.
@@ -217,6 +258,42 @@ pub struct BgpYamlConfig {
     pub peers: Vec<BgpPeerYaml>,
     /// Mixed v4/v6 prefix list (each entry is a CIDR string).
     /// Stable schema across releases.
+    #[serde(default)]
+    pub announced_prefixes: Vec<String>,
+    #[serde(default)]
+    pub listen_address: Option<String>,
+    #[serde(default)]
+    pub aggregate_addresses_v4: Vec<AggregateAddressYaml>,
+    #[serde(default)]
+    pub aggregate_addresses_v6: Vec<AggregateAddressYaml>,
+    /// Per-VRF BGP instances. Each entry is a self-contained
+    /// `BgpYamlConfig`-shaped block with its own peers / ASN /
+    /// router-id / announced-prefixes / aggregates. The supervisor
+    /// spawns one bgpd@<vrf-name> child per entry, passing
+    /// `--vrf <name>` so the daemon picks its slice. The default
+    /// VRF stays at the top-level fields above.
+    #[serde(default)]
+    pub vrfs: Vec<BgpVrfYaml>,
+}
+
+/// On-disk shape of a single per-VRF BGP instance. Mirrors
+/// `BgpYamlConfig` (without nested `vrfs`) plus a required `name`
+/// matching a top-level `vrfs[].name`. Loader cross-references the
+/// name against the router-config `vrfs:` block to pick up
+/// `table_id_v4` / `table_id_v6`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct BgpVrfYaml {
+    /// VRF name. Must match a `vrfs[].name` in the top-level
+    /// router config.
+    pub name: String,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub asn: Option<u32>,
+    #[serde(default)]
+    pub router_id: Option<String>,
+    #[serde(default)]
+    pub peers: Vec<BgpPeerYaml>,
     #[serde(default)]
     pub announced_prefixes: Vec<String>,
     #[serde(default)]
@@ -282,6 +359,25 @@ pub struct RouterYaml {
     /// top-level block with `NoExtras`.
     #[serde(default)]
     pub route_maps: Vec<RouteMapYaml<BgpMatchYaml, BgpSetYaml>>,
+    /// Top-level VRF declarations (`name`, `table_id_v4`,
+    /// `table_id_v6`). bgpd reads this to map `--vrf <name>` to
+    /// the v4/v6 FIB ids it stamps onto Routes pushed to ribd.
+    /// Mirror of impd's `vrfs:` block — see imp/api/config.proto.
+    #[serde(default)]
+    pub vrfs: Vec<VrfYaml>,
+}
+
+/// On-disk VRF declaration. bgpd only cares about the table-ids;
+/// other fields (description) are tolerated but ignored.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct VrfYaml {
+    pub name: String,
+    #[serde(default)]
+    pub table_id_v4: u32,
+    #[serde(default)]
+    pub table_id_v6: u32,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 impl BgpDaemonConfig {
@@ -304,18 +400,74 @@ impl BgpDaemonConfig {
     /// route-maps can keep using [`Self::from_yaml`].
     pub fn from_router_yaml(router: RouterYaml) -> Result<Self, ConfigError> {
         let mut bgp = Self::from_yaml(router.bgp)?;
-        let mut maps: HashMap<String, BgpRouteMap> = HashMap::new();
-        for m in router.route_maps {
-            let name = m.name.clone();
-            if maps.contains_key(&name) {
-                return Err(ConfigError::DuplicateRouteMapName(name));
-            }
-            let compiled = crate::route_map::compile(m)
-                .map_err(|e| ConfigError::RouteMapCompile(name.clone(), e))?;
-            maps.insert(name, compiled);
-        }
-        bgp.route_maps = maps;
+        bgp.route_maps = compile_route_maps(router.route_maps)?;
+        // Default-VRF instance: table_id stays 0.
         Ok(bgp)
+    }
+
+    /// Build a per-VRF instance: pick `bgp.vrfs[name]`, look up the
+    /// matching `vrfs[name]` for table-ids, and apply the
+    /// router-wide `route_maps:` block (route-maps are shared
+    /// across instances). Returns ConfigError::UnknownVrf if `name`
+    /// has no matching `bgp.vrfs[]` entry, and InvalidVrf if the
+    /// referenced top-level `vrfs[]` block is missing or has
+    /// table_id 0 (reserved).
+    pub fn from_router_yaml_for_vrf(
+        router: RouterYaml,
+        vrf_name: &str,
+    ) -> Result<Self, ConfigError> {
+        // Find the per-VRF bgp slice.
+        let vrf_yaml = router
+            .bgp
+            .vrfs
+            .iter()
+            .find(|v| v.name == vrf_name)
+            .cloned()
+            .ok_or_else(|| ConfigError::UnknownVrf(vrf_name.to_string()))?;
+
+        // Look up table-ids from the top-level vrfs: block.
+        let vrf_decl = router
+            .vrfs
+            .iter()
+            .find(|v| v.name == vrf_name)
+            .ok_or_else(|| ConfigError::UndeclaredVrf(vrf_name.to_string()))?;
+        if vrf_decl.table_id_v4 == 0 || vrf_decl.table_id_v6 == 0 {
+            return Err(ConfigError::InvalidVrf(format!(
+                "vrf '{}' has reserved table_id 0",
+                vrf_name
+            )));
+        }
+
+        // Convert the per-VRF YAML into a flat BgpYamlConfig and
+        // run the existing parser, then stamp table-ids and the
+        // VRF identity.
+        let flat = BgpYamlConfig {
+            enabled: vrf_yaml.enabled,
+            asn: vrf_yaml.asn,
+            router_id: vrf_yaml.router_id,
+            peers: vrf_yaml.peers,
+            announced_prefixes: vrf_yaml.announced_prefixes,
+            listen_address: vrf_yaml.listen_address,
+            aggregate_addresses_v4: vrf_yaml.aggregate_addresses_v4,
+            aggregate_addresses_v6: vrf_yaml.aggregate_addresses_v6,
+            vrfs: Vec::new(),
+        };
+        let mut bgp = Self::from_yaml(flat)?;
+        bgp.route_maps = compile_route_maps(router.route_maps)?;
+        bgp.table_id_v4 = vrf_decl.table_id_v4;
+        bgp.table_id_v6 = vrf_decl.table_id_v6;
+        bgp.vrf_name = Some(vrf_name.to_string());
+        Ok(bgp)
+    }
+
+    /// Per-VRF wrapper around `load_from_yaml`.
+    pub fn load_from_yaml_for_vrf(path: &Path, vrf_name: &str) -> Result<Self, ConfigError> {
+        let bytes = std::fs::read(path).map_err(|e| ConfigError::Io {
+            path: path.display().to_string(),
+            source: e,
+        })?;
+        let router: RouterYaml = serde_yaml::from_slice(&bytes)?;
+        Self::from_router_yaml_for_vrf(router, vrf_name)
     }
 
     /// Convert an already-parsed `BgpYamlConfig` into the
@@ -441,6 +593,12 @@ impl BgpDaemonConfig {
             aggregates_v6,
             listen_address: yaml.listen_address,
             route_maps: HashMap::new(),
+            // Default-VRF identity. `from_router_yaml_for_vrf`
+            // overrides these with the operator-assigned table-ids
+            // and the matching name.
+            table_id_v4: 0,
+            table_id_v6: 0,
+            vrf_name: None,
         })
     }
 }
@@ -691,5 +849,67 @@ bgp:
         let router: RouterYaml = serde_yaml::from_str(blob).unwrap();
         let cfg = BgpDaemonConfig::from_yaml(router.bgp).unwrap();
         assert_eq!(cfg.local_asn, 0);
+    }
+
+    fn vrf_yaml() -> &'static str {
+        r#"
+vrfs:
+  - name: cust-a
+    table_id_v4: 100
+    table_id_v6: 200
+bgp:
+  enabled: false
+  vrfs:
+    - name: cust-a
+      enabled: true
+      asn: 65001
+      router_id: 10.0.0.1
+      peers:
+        - peer_ip: 192.0.2.1
+          peer_asn: 65002
+"#
+    }
+
+    #[test]
+    fn per_vrf_loader_picks_named_slice() {
+        let router: RouterYaml = serde_yaml::from_str(vrf_yaml()).unwrap();
+        let cfg = BgpDaemonConfig::from_router_yaml_for_vrf(router, "cust-a").unwrap();
+        assert_eq!(cfg.local_asn, 65001);
+        assert_eq!(cfg.peers.len(), 1);
+        assert_eq!(cfg.table_id_v4, 100);
+        assert_eq!(cfg.table_id_v6, 200);
+        assert_eq!(cfg.vrf_name.as_deref(), Some("cust-a"));
+        assert!(cfg.enabled);
+    }
+
+    #[test]
+    fn per_vrf_loader_rejects_unknown_vrf() {
+        let router: RouterYaml = serde_yaml::from_str(vrf_yaml()).unwrap();
+        let err = BgpDaemonConfig::from_router_yaml_for_vrf(router, "cust-b").unwrap_err();
+        assert!(matches!(err, ConfigError::UnknownVrf(_)), "got {:?}", err);
+    }
+
+    #[test]
+    fn per_vrf_loader_rejects_undeclared_vrf() {
+        // bgp.vrfs has cust-a but the top-level vrfs: block does not.
+        let blob = r#"
+bgp:
+  vrfs:
+    - name: orphan
+      enabled: true
+      asn: 65001
+"#;
+        let router: RouterYaml = serde_yaml::from_str(blob).unwrap();
+        let err = BgpDaemonConfig::from_router_yaml_for_vrf(router, "orphan").unwrap_err();
+        assert!(matches!(err, ConfigError::UndeclaredVrf(_)), "got {:?}", err);
+    }
+
+    #[test]
+    fn default_vrf_loader_keeps_table_ids_zero() {
+        let router: RouterYaml = serde_yaml::from_str(vrf_yaml()).unwrap();
+        let cfg = BgpDaemonConfig::from_router_yaml(router).unwrap();
+        assert_eq!(cfg.table_id_v4, 0);
+        assert_eq!(cfg.table_id_v6, 0);
+        assert!(cfg.vrf_name.is_none());
     }
 }

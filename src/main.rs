@@ -46,6 +46,10 @@ struct RunArgs {
     rib_socket: String,
     control_socket: String,
     use_vcl: bool,
+    /// Per-VRF instance name, set when the daemon was launched
+    /// with `--vrf <name>`. None for the default-VRF (table 0)
+    /// instance that retains the legacy single-tenant behaviour.
+    vrf: Option<String>,
 }
 
 struct QueryArgs {
@@ -63,7 +67,7 @@ enum OutputFormat {
 fn print_usage_and_exit(code: u8) -> ExitCode {
     eprintln!("Usage:");
     eprintln!(
-        "  bgpd [--config PATH] [--rib-socket PATH] [--control-socket PATH] [--vcl]"
+        "  bgpd [--config PATH] [--rib-socket PATH] [--control-socket PATH] [--vcl] [--vrf NAME]"
     );
     eprintln!("  bgpd query [-o text|json] <summary|neighbors|routes>");
     eprintln!("  bgpd query [-o text|json] advertised <peer-ip>");
@@ -140,6 +144,7 @@ fn parse_args() -> Option<Command> {
     let mut rib_socket = DEFAULT_RIB_SOCKET.to_string();
     let mut control_socket = DEFAULT_CONTROL_SOCKET.to_string();
     let mut use_vcl = false;
+    let mut vrf: Option<String> = None;
     let mut i = 0;
     while i < raw.len() {
         match raw[i].as_str() {
@@ -159,6 +164,10 @@ fn parse_args() -> Option<Command> {
                 use_vcl = true;
                 i += 1;
             }
+            "--vrf" => {
+                vrf = Some(raw.get(i + 1)?.clone());
+                i += 2;
+            }
             _ => return None,
         }
     }
@@ -167,6 +176,7 @@ fn parse_args() -> Option<Command> {
         rib_socket,
         control_socket,
         use_vcl,
+        vrf,
     }))
 }
 
@@ -221,11 +231,23 @@ async fn run_daemon(args: &RunArgs) -> anyhow::Result<()> {
         config = %args.config_path.display(),
         rib_socket = %args.rib_socket,
         control_socket = %args.control_socket,
+        vrf = ?args.vrf,
         "bgpd starting"
     );
 
-    let config = BgpDaemonConfig::load_from_yaml(&args.config_path)
-        .with_context(|| format!("loading {}", args.config_path.display()))?;
+    // Pick the loader by --vrf presence. Default-VRF uses the
+    // legacy single-tenant loader (top-level `bgp:` block);
+    // per-VRF instances pull their slice from `bgp.vrfs[name]`
+    // and stamp every Route with the VRF's table-ids on the
+    // way to ribd.
+    let config = match &args.vrf {
+        None => BgpDaemonConfig::load_from_yaml(&args.config_path)
+            .with_context(|| format!("loading {}", args.config_path.display()))?,
+        Some(name) => BgpDaemonConfig::load_from_yaml_for_vrf(&args.config_path, name)
+            .with_context(|| {
+                format!("loading {} for vrf {}", args.config_path.display(), name)
+            })?,
+    };
 
     // Seed the snapshot with whatever identity the config carries
     // (router-id, local ASN). This works even when BGP is

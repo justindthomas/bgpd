@@ -956,7 +956,8 @@ impl BgpInstance {
 
     async fn push_full(&mut self) -> Result<()> {
         let snap = self.snapshot.lock().await;
-        rib_push::push_full_rib(&mut self.rib, &snap.loc_rib)
+        let vrf = rib_push::VrfId::from_config(&self.config);
+        rib_push::push_full_rib(&mut self.rib, &snap.loc_rib, vrf)
             .await
             .context("pushing Loc-RIB to ribd")?;
         Ok(())

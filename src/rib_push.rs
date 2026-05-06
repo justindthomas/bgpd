@@ -47,11 +47,29 @@ use crate::packet::update::{Prefix4, Prefix6};
 /// docstring for sizing rationale.
 pub const CHUNK_SIZE: usize = 50_000;
 
+/// Per-VRF identity for the bgpd instance. Stamped onto every
+/// `RibRoute` so ribd programs the route in the right FIB. Default-
+/// VRF instance carries (0, 0).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VrfId {
+    pub table_id_v4: u32,
+    pub table_id_v6: u32,
+}
+
+impl VrfId {
+    pub fn from_config(cfg: &crate::config::BgpDaemonConfig) -> Self {
+        VrfId {
+            table_id_v4: cfg.table_id_v4,
+            table_id_v6: cfg.table_id_v6,
+        }
+    }
+}
+
 /// Convert a Loc-RIB winner's `(prefix, StoredRoute)` pair into
 /// an `ribd_proto::Route` ready to push. Picks the right
 /// `Source` (Bgp vs BgpInternal) from the eBGP/iBGP flag and
 /// emits a `NextHop::Recursive` so ribd does the resolution.
-fn build_v4_route(prefix: &Prefix4, route: &StoredRoute) -> Option<RibRoute> {
+fn build_v4_route(prefix: &Prefix4, route: &StoredRoute, vrf: VrfId) -> Option<RibRoute> {
     let nh_addr = route.next_hop_v4()?;
     let source = if route.is_ebgp {
         RibSource::Bgp
@@ -73,10 +91,11 @@ fn build_v4_route(prefix: &Prefix4, route: &StoredRoute) -> Option<RibRoute> {
         metric: route.med().unwrap_or(0),
         tag: 0,
         admin_distance: None,
+        table_id: vrf.table_id_v4,
     })
 }
 
-fn build_v6_route(prefix: &Prefix6, route: &StoredRoute) -> Option<RibRoute> {
+fn build_v6_route(prefix: &Prefix6, route: &StoredRoute, vrf: VrfId) -> Option<RibRoute> {
     let nh_addr = route.next_hop_v6()?;
     let source = if route.is_ebgp {
         RibSource::Bgp
@@ -94,13 +113,14 @@ fn build_v6_route(prefix: &Prefix6, route: &StoredRoute) -> Option<RibRoute> {
         metric: route.med().unwrap_or(0),
         tag: 0,
         admin_distance: None,
+        table_id: vrf.table_id_v6,
     })
 }
 
 /// Build the full route list to push for a given source. eBGP
 /// and iBGP routes are pushed under different `Source` values, so
 /// each call covers exactly one source.
-fn collect_routes(loc: &LocRib, source: RibSource) -> Vec<RibRoute> {
+fn collect_routes(loc: &LocRib, source: RibSource, vrf: VrfId) -> Vec<RibRoute> {
     let want_ebgp = matches!(source, RibSource::Bgp);
     let mut out = Vec::with_capacity(loc.len());
     for (prefix, entry) in &loc.v4_unicast {
@@ -114,7 +134,7 @@ fn collect_routes(loc: &LocRib, source: RibSource) -> Vec<RibRoute> {
         if entry.winner.is_ebgp != want_ebgp {
             continue;
         }
-        if let Some(r) = build_v4_route(prefix, &entry.winner) {
+        if let Some(r) = build_v4_route(prefix, &entry.winner, vrf) {
             out.push(r);
         }
     }
@@ -125,7 +145,7 @@ fn collect_routes(loc: &LocRib, source: RibSource) -> Vec<RibRoute> {
         if entry.winner.is_ebgp != want_ebgp {
             continue;
         }
-        if let Some(r) = build_v6_route(prefix, &entry.winner) {
+        if let Some(r) = build_v6_route(prefix, &entry.winner, vrf) {
             out.push(r);
         }
     }
@@ -138,13 +158,16 @@ fn collect_routes(loc: &LocRib, source: RibSource) -> Vec<RibRoute> {
 pub async fn push_full_rib(
     conn: &mut RibConnection,
     loc: &LocRib,
+    vrf: VrfId,
 ) -> Result<(), ClientError> {
-    let ebgp_routes = collect_routes(loc, RibSource::Bgp);
-    let ibgp_routes = collect_routes(loc, RibSource::BgpInternal);
+    let ebgp_routes = collect_routes(loc, RibSource::Bgp, vrf);
+    let ibgp_routes = collect_routes(loc, RibSource::BgpInternal, vrf);
 
     tracing::info!(
         ebgp = ebgp_routes.len(),
         ibgp = ibgp_routes.len(),
+        table_id_v4 = vrf.table_id_v4,
+        table_id_v6 = vrf.table_id_v6,
         "pushing Loc-RIB to ribd as chunked bulks"
     );
 
@@ -164,15 +187,16 @@ pub async fn push_incremental(
     prefix_v4: Option<&Prefix4>,
     prefix_v6: Option<&Prefix6>,
     new_winner: Option<&StoredRoute>,
+    vrf: VrfId,
 ) -> Result<(), ClientError> {
     match (prefix_v4, prefix_v6, new_winner) {
         (Some(p), None, Some(w)) => {
-            if let Some(route) = build_v4_route(p, w) {
+            if let Some(route) = build_v4_route(p, w, vrf) {
                 conn.update(Action::Add, route).await?;
             }
         }
         (None, Some(p), Some(w)) => {
-            if let Some(route) = build_v6_route(p, w) {
+            if let Some(route) = build_v6_route(p, w, vrf) {
                 conn.update(Action::Add, route).await?;
             }
         }
@@ -199,6 +223,7 @@ pub async fn push_incremental(
                     metric: 0,
                     tag: 0,
                     admin_distance: None,
+                    table_id: vrf.table_id_v4,
                 };
                 conn.update(Action::Delete, route).await?;
             }
@@ -216,6 +241,7 @@ pub async fn push_incremental(
                     metric: 0,
                     tag: 0,
                     admin_distance: None,
+                    table_id: vrf.table_id_v6,
                 };
                 conn.update(Action::Delete, route).await?;
             }
@@ -280,7 +306,7 @@ mod tests {
     fn build_v4_route_uses_recursive_nexthop() {
         let route = ebgp_route(65001, 65000, Ipv4Addr::new(10, 0, 0, 5));
         let prefix = p4(192, 0, 2, 0, 24);
-        let r = build_v4_route(&prefix, &route).unwrap();
+        let r = build_v4_route(&prefix, &route, VrfId::default()).unwrap();
         assert_eq!(r.source, RibSource::Bgp);
         assert_eq!(r.next_hops.len(), 1);
         assert!(r.next_hops[0].is_recursive());
@@ -293,7 +319,7 @@ mod tests {
         let route = ebgp_route(65000, 65000, Ipv4Addr::new(10, 0, 0, 5));
         // peer_asn == local_asn → is_ebgp false
         assert!(!route.is_ebgp);
-        let r = build_v4_route(&p4(192, 0, 2, 0, 24), &route).unwrap();
+        let r = build_v4_route(&p4(192, 0, 2, 0, 24), &route, VrfId::default()).unwrap();
         assert_eq!(r.source, RibSource::BgpInternal);
     }
 
@@ -301,7 +327,7 @@ mod tests {
     fn build_v4_route_propagates_med_as_metric() {
         let mut route = ebgp_route(65001, 65000, Ipv4Addr::new(10, 0, 0, 5));
         route.path_attributes.push(PathAttribute::MultiExitDisc(42));
-        let r = build_v4_route(&p4(192, 0, 2, 0, 24), &route).unwrap();
+        let r = build_v4_route(&p4(192, 0, 2, 0, 24), &route, VrfId::default()).unwrap();
         assert_eq!(r.metric, 42);
     }
 
@@ -319,8 +345,8 @@ mod tests {
             ebgp_route(65000, 65000, Ipv4Addr::new(10, 0, 0, 2)),
         );
         let loc = LocRib::rebuild(&[(1, &rib_a), (2, &rib_b)]);
-        let ebgp = collect_routes(&loc, RibSource::Bgp);
-        let ibgp = collect_routes(&loc, RibSource::BgpInternal);
+        let ebgp = collect_routes(&loc, RibSource::Bgp, VrfId::default());
+        let ibgp = collect_routes(&loc, RibSource::BgpInternal, VrfId::default());
         assert_eq!(ebgp.len(), 1);
         assert_eq!(ibgp.len(), 1);
         assert_eq!(ebgp[0].source, RibSource::Bgp);
