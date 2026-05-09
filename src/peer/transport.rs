@@ -351,7 +351,8 @@ pub mod vcl_transport {
 
         // Bind source if configured.
         if let Some(src) = source {
-            let mut ep = vcl_rs::session::endpoint_from_addr(src);
+            let mut src_ip_buf = [0u8; 16];
+            let mut ep = vcl_rs::session::endpoint_into_buf(src, &mut src_ip_buf);
             let rc = unsafe { vcl_rs::ffi::vppcom_session_bind(sh, &mut ep) };
             if rc < 0 {
                 let _ = ready_tx.send(Err(format!("bind failed: {}", rc)));
@@ -361,7 +362,8 @@ pub mod vcl_transport {
         }
 
         // Connect (blocking).
-        let mut ep = vcl_rs::session::endpoint_from_addr(peer);
+        let mut peer_ip_buf = [0u8; 16];
+        let mut ep = vcl_rs::session::endpoint_into_buf(peer, &mut peer_ip_buf);
         let rc = unsafe { vcl_rs::ffi::vppcom_session_connect(sh, &mut ep) };
         if rc < 0 {
             let _ = ready_tx.send(Err(format!("connect to {} failed: {}", peer, rc)));
