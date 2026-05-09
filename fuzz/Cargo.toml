@@ -1,0 +1,47 @@
+[package]
+name = "bgpd-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.bgpd]
+path = ".."
+# Default features only — bgpd's `vcl` feature pulls in libvppcom via
+# vcl-rs, which we don't want in the fuzz harness (no need for VPP
+# session-layer plumbing during pure-bytes-in parsing). Path-dep
+# `[patch]` entries in ../Cargo.toml propagate through this dep.
+default-features = false
+
+[[bin]]
+name = "parse_header"
+path = "fuzz_targets/parse_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_open"
+path = "fuzz_targets/parse_open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_update"
+path = "fuzz_targets/parse_update.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_path_attribute"
+path = "fuzz_targets/parse_path_attribute.rs"
+test = false
+doc = false
+bench = false
