@@ -131,11 +131,21 @@ impl Open {
         p += 2;
         buf[p..p + 4].copy_from_slice(&self.bgp_identifier.octets());
         p += 4;
-        buf[p] = opt_params_len as u8;
+        // The OPEN opt-params length and the type-2 (Capabilities)
+        // optional parameter length are both 1-byte wire fields
+        // (RFC 4271 §4.2, RFC 5492 §4). bgpd's current capability
+        // set is well below the limit, but try_from converts a
+        // silent wire-corruption bug into an immediate panic if
+        // future capabilities ever push the block past 255 bytes.
+        // RFC 9072 defines an extended (2-byte) form, but it must
+        // be negotiated, so until then 255 bytes is a hard ceiling.
+        buf[p] = u8::try_from(opt_params_len)
+            .expect("OPEN opt-params length exceeds 255 bytes");
         p += 1;
         if !caps_block.is_empty() {
             buf[p] = OPT_PARAM_CAPABILITIES;
-            buf[p + 1] = caps_block.len() as u8;
+            buf[p + 1] = u8::try_from(caps_block.len())
+                .expect("OPEN capabilities block exceeds 255 bytes");
             buf[p + 2..p + 2 + caps_block.len()].copy_from_slice(&caps_block);
         }
         buf

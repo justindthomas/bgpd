@@ -118,12 +118,21 @@ pub struct AsPathSegment {
 impl AsPathSegment {
     /// Encode one segment: 1-byte type, 1-byte ASN count, N×4-byte
     /// ASNs (RFC 6793 §3, 4-octet form).
+    ///
+    /// The wire count field is a single byte, so a segment carrying
+    /// more than 255 ASNs is split into multiple wire segments of
+    /// the same type. This matters because `prepend_local_asn` can
+    /// grow a 255-ASN segment to 256 — without splitting, the cast
+    /// would wrap to a count of 0, which RFC 4271 §4.3 forbids and
+    /// downstream peers reject with a Malformed AS_PATH NOTIFICATION.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(2 + 4 * self.asns.len());
-        out.push(self.seg_type as u8);
-        out.push(self.asns.len() as u8);
-        for asn in &self.asns {
-            out.extend_from_slice(&asn.to_be_bytes());
+        for chunk in self.asns.chunks(u8::MAX as usize) {
+            out.push(self.seg_type as u8);
+            out.push(chunk.len() as u8);
+            for asn in chunk {
+                out.extend_from_slice(&asn.to_be_bytes());
+            }
         }
         out
     }
@@ -679,6 +688,59 @@ mod tests {
             "got {:02x?}",
             bytes
         );
+    }
+
+    #[test]
+    fn as_path_encode_splits_oversized_segment_at_255() {
+        // RFC 4271 §4.3 caps a segment's count at 255 (one byte).
+        // A 256-ASN segment must split into two segments rather than
+        // wrap the count byte to 0 — peers reject count-zero segments
+        // with a Malformed AS_PATH NOTIFICATION.
+        let asns: Vec<u32> = (1..=256).collect();
+        let attr = PathAttribute::AsPath(vec![AsPathSegment {
+            seg_type: AsPathSegmentType::AsSequence,
+            asns: asns.clone(),
+        }]);
+        let value = match &attr {
+            PathAttribute::AsPath(_) => {
+                let bytes = attr.encode();
+                let (parsed, _) = PathAttribute::parse(&bytes).unwrap();
+                parsed
+            }
+            _ => unreachable!(),
+        };
+        match value {
+            PathAttribute::AsPath(segs) => {
+                assert_eq!(segs.len(), 2, "expected split into two segments");
+                assert_eq!(segs[0].asns.len(), 255);
+                assert_eq!(segs[1].asns.len(), 1);
+                let mut joined: Vec<u32> = segs[0].asns.clone();
+                joined.extend(&segs[1].asns);
+                assert_eq!(joined, asns);
+            }
+            other => panic!("wrong variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn as_path_encode_no_zero_count_byte_for_256_asn_segment() {
+        // Direct check that the wire bytes never contain a count of
+        // zero in a count position — guards against future encoder
+        // regressions that could re-introduce the cast wrap.
+        let seg = AsPathSegment {
+            seg_type: AsPathSegmentType::AsSequence,
+            asns: (1..=256).collect(),
+        };
+        let bytes = seg.encode();
+        // Walk the segments and assert each count byte is > 0.
+        let mut p = 0;
+        while p < bytes.len() {
+            assert!(bytes.len() - p >= 2, "truncated segment header");
+            let count = bytes[p + 1];
+            assert!(count > 0, "RFC 4271 §4.3: segment count must be > 0");
+            p += 2 + 4 * count as usize;
+        }
+        assert_eq!(p, bytes.len(), "trailing bytes after final segment");
     }
 
     #[test]
