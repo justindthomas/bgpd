@@ -148,6 +148,13 @@ pub struct PeerSnapshot {
     pub id: PeerId,
     pub address: std::net::IpAddr,
     pub asn: u32,
+    /// Effective local AS for this peer's session — either the
+    /// peer's `local_asn` override or the daemon's global. Stored
+    /// per-peer so multi-AS deployments (one daemon hosting iBGP
+    /// sessions in different ASes) get correct OPEN, AS_PATH
+    /// prepend, and loop-detection behavior without re-resolving
+    /// the override on every UPDATE.
+    pub local_asn: u32,
     pub state: PeerState,
     pub negotiated_hold_time: u16,
     pub is_ebgp: bool,
@@ -499,6 +506,7 @@ mod tests {
             id: 1,
             address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
             asn: 65001,
+            local_asn: 65000,
             state: PeerState::Established,
             negotiated_hold_time: 90,
             is_ebgp: true,
@@ -508,6 +516,7 @@ mod tests {
             id: 2,
             address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)),
             asn: 65002,
+            local_asn: 65000,
             state: PeerState::Idle,
             negotiated_hold_time: 0,
             is_ebgp: true,
@@ -525,6 +534,7 @@ mod tests {
             id: 1,
             address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
             asn: 65001,
+            local_asn: 65000,
             state: PeerState::Established,
             negotiated_hold_time: 90,
             is_ebgp: true,
@@ -545,6 +555,7 @@ mod tests {
             id: 1,
             address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             asn: 65001,
+            local_asn: 65000,
             state: PeerState::Established,
             negotiated_hold_time: 90,
             is_ebgp: true,

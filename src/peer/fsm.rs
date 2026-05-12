@@ -577,6 +577,30 @@ mod tests {
     }
 
     #[test]
+    fn outbound_open_carries_configured_local_asn() {
+        // Per-peer local-AS override: the FSM is constructed with
+        // local_asn=65101 (different from the daemon-global the
+        // operator might have), and the OPEN it sends must carry
+        // 65101 — that's what makes a router straddling multiple
+        // ASes work.
+        let mut fsm = Fsm::new(PeerFsmConfig {
+            local_asn: 65101,
+            remote_asn: 65101,
+            ..config()
+        });
+        fsm.handle_event(PeerEvent::Start);
+        let actions = fsm.handle_event(PeerEvent::TcpConnected);
+        let open = actions
+            .iter()
+            .find_map(|a| match a {
+                Action::SendOpen(o) => Some(o),
+                _ => None,
+            })
+            .expect("Connect→OpenSent emits SendOpen");
+        assert_eq!(open.asn, 65101);
+    }
+
+    #[test]
     fn open_with_wrong_asn_sends_notification() {
         let mut fsm = Fsm::new(config());
         fsm.handle_event(PeerEvent::Start);

@@ -360,13 +360,17 @@ impl BgpInstance {
         peer_id: PeerId,
         cfg: &BgpPeerConfig,
     ) -> Result<()> {
-        let router_id = self
-            .config
-            .router_id
+        // router-id resolves from peer override first, then daemon
+        // global. Either is sufficient — a multi-AS deployment may
+        // omit the global and supply a per-peer router-id for
+        // every peer.
+        let effective_router_id = cfg
+            .effective_router_id(self.config.router_id)
             .ok_or_else(|| anyhow!("BGP router_id required to spawn peer {}", cfg.address))?;
+        let effective_local_asn = cfg.effective_local_asn(self.config.local_asn);
         let fsm_config = PeerFsmConfig {
-            local_asn: self.config.local_asn,
-            local_router_id: router_id,
+            local_asn: effective_local_asn,
+            local_router_id: effective_router_id,
             remote_asn: cfg.remote_asn,
             local_hold_time: cfg.hold_time.unwrap_or(90),
             connect_retry: Duration::from_secs(120),
@@ -395,9 +399,10 @@ impl BgpInstance {
                 id: peer_id,
                 address: cfg.address,
                 asn: cfg.remote_asn,
+                local_asn: effective_local_asn,
                 state: PeerState::Idle,
                 negotiated_hold_time: 0,
-                is_ebgp: cfg.remote_asn != self.config.local_asn,
+                is_ebgp: cfg.remote_asn != effective_local_asn,
                 adj_rib_in: AdjRibIn::new(),
             });
         }
@@ -426,7 +431,7 @@ impl BgpInstance {
         // aren't keywords are looked up against the daemon's
         // route_maps; an unknown name logs a warning and falls
         // back to the default.
-        let is_ebgp = cfg.remote_asn != self.config.local_asn;
+        let is_ebgp = cfg.remote_asn != effective_local_asn;
         let default_policy = if is_ebgp {
             crate::policy::PeerPolicy::ebgp_default_deny()
         } else {
@@ -755,7 +760,8 @@ impl BgpInstance {
             let Some(&pid) = old_by_addr.get(&new_p.address) else {
                 continue; // New peer — handled below.
             };
-            let is_ebgp = new_p.remote_asn != new_config.local_asn;
+            let effective_local_asn = new_p.effective_local_asn(new_config.local_asn);
+            let is_ebgp = new_p.remote_asn != effective_local_asn;
             let default_policy = if is_ebgp {
                 crate::policy::PeerPolicy::ebgp_default_deny()
             } else {
@@ -1006,10 +1012,10 @@ impl BgpInstance {
     /// address yet.
     async fn resolve_advertise_ctx(&self, peer_id: PeerId) -> Option<AdvertiseCtx> {
         let tx = self.peer_controls.get(&peer_id).cloned()?;
-        let (is_ebgp, established) = {
+        let (is_ebgp, established, local_asn) = {
             let snap = self.snapshot.lock().await;
             let p = snap.peers.iter().find(|p| p.id == peer_id)?;
-            (p.is_ebgp, p.state == PeerState::Established)
+            (p.is_ebgp, p.state == PeerState::Established, p.local_asn)
         };
         if !established {
             return None;
@@ -1046,7 +1052,7 @@ impl BgpInstance {
             is_ebgp,
             export_policy,
             redistribute,
-            local_asn: self.config.local_asn,
+            local_asn,
             nh_v4,
             nh_v6,
         })
@@ -1374,12 +1380,16 @@ fn apply_update_to_peer(
     update: Update,
     import_policy: &crate::policy::Policy,
 ) -> Result<()> {
-    let local_asn = snap.local_asn;
     let peer = snap
         .peers
         .iter_mut()
         .find(|p| p.id == peer_id)
         .ok_or_else(|| anyhow!("peer {} not found in snapshot", peer_id))?;
+    // Use this peer's effective local AS, not the daemon's
+    // global. Multi-AS deployments (each peer in its own
+    // local-AS) need per-session loop detection and per-session
+    // is_ebgp tagging on the StoredRoute.
+    let local_asn = peer.local_asn;
     let is_ebgp = peer.is_ebgp;
 
     // v4 withdrawals first. Withdrawals are not subject to loop
@@ -1745,6 +1755,12 @@ struct AdvertisedPrefixes {
 /// Per-peer state assembled once per `advertise_to_peer` call and
 /// threaded through the four phase methods. Owning the `tx` clone
 /// here keeps the phase signatures free of `&self`.
+///
+/// `local_asn` is the peer's *effective* local AS (override or
+/// daemon global), not necessarily `self.config.local_asn`.
+/// AS_PATH prepend on eBGP-classified sessions uses this value so
+/// a per-peer override (a router straddling multiple ASes)
+/// produces the right path on the wire.
 struct AdvertiseCtx {
     tx: mpsc::Sender<PeerControl>,
     is_ebgp: bool,
@@ -2036,6 +2052,7 @@ mod tests {
             id: 1,
             address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
             asn: 65001,
+            local_asn: 65000,
             state: PeerState::Established,
             negotiated_hold_time: 90,
             is_ebgp: true,
@@ -2462,6 +2479,61 @@ statements:
     }
 
     #[test]
+    fn apply_update_loop_detection_uses_per_peer_local_asn() {
+        // Per-peer local-AS override: snap.local_asn is the
+        // daemon-global (65000) but this eBGP peer is configured
+        // with local_asn=65500. A route arriving with 65500 in
+        // its AS_PATH is a loop *for this session*, even though
+        // 65500 doesn't appear in any other peer's local-AS.
+        // Demonstrates the inbound path keys off peer.local_asn,
+        // not snap.local_asn.
+        let mut snap = snapshot_with_peer();
+        snap.peers[0].local_asn = 65500;
+        let update = Update {
+            withdrawn_v4: Vec::new(),
+            path_attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(vec![AsPathSegment {
+                    seg_type: AsPathSegmentType::AsSequence,
+                    // 65500 is the override; loop must drop.
+                    asns: vec![65001, 65500, 65002],
+                }]),
+                PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
+            ],
+            nlri_v4: vec![p4(192, 0, 2, 0, 24)],
+        };
+        apply_update_to_peer(&mut snap, 1, update, &crate::policy::Policy::AcceptAll).unwrap();
+        assert!(
+            snap.peers[0].adj_rib_in.v4_unicast.is_empty(),
+            "per-peer local-AS in AS_PATH must trigger loop drop"
+        );
+
+        // Sanity: a route containing the daemon-global ASN (65000)
+        // — but *not* this peer's override — is NOT a loop for
+        // this session and is accepted.
+        let mut snap = snapshot_with_peer();
+        snap.peers[0].local_asn = 65500;
+        let update = Update {
+            withdrawn_v4: Vec::new(),
+            path_attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(vec![AsPathSegment {
+                    seg_type: AsPathSegmentType::AsSequence,
+                    asns: vec![65001, 65000, 65002],
+                }]),
+                PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
+            ],
+            nlri_v4: vec![p4(192, 0, 2, 0, 24)],
+        };
+        apply_update_to_peer(&mut snap, 1, update, &crate::policy::Policy::AcceptAll).unwrap();
+        assert_eq!(
+            snap.peers[0].adj_rib_in.v4_unicast.len(),
+            1,
+            "global ASN in AS_PATH is not a loop for an override-AS peer"
+        );
+    }
+
+    #[test]
     fn apply_update_does_not_loop_detect_on_ibgp() {
         // iBGP sessions preserve the AS_PATH unchanged from the
         // origin, so "local ASN appears" is expected and must
@@ -2780,6 +2852,7 @@ statements:
                 id,
                 address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, id as u8)),
                 asn,
+                local_asn: 65000,
                 state: PeerState::Established,
                 negotiated_hold_time: 90,
                 is_ebgp: true,

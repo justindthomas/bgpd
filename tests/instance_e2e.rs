@@ -245,6 +245,8 @@ async fn instance_e2e_pushes_received_route_to_ribd() {
             address: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
             port: Some(bgp_addr.port()),
             remote_asn: REMOTE_ASN,
+            local_asn: None,
+            router_id: None,
             source_address: None,
             password: None,
             hold_time: Some(9),
@@ -259,6 +261,9 @@ async fn instance_e2e_pushes_received_route_to_ribd() {
         aggregates_v6: Vec::new(),
         listen_address: None,
         route_maps: std::collections::HashMap::new(),
+        table_id_v4: 0,
+        table_id_v6: 0,
+        vrf_name: None,
     };
 
     // 4. Build the instance against the fake ribd, spawn

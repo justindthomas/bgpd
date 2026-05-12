@@ -124,6 +124,21 @@ pub struct BgpPeerConfig {
     pub port: Option<u16>,
     /// Remote AS — used to classify the session as eBGP or iBGP.
     pub remote_asn: u32,
+    /// Per-peer override of the daemon's local AS. When set, this
+    /// peer's OPEN advertises this ASN, AS_PATH manipulation
+    /// (prepend / loop-detection) uses this ASN, and iBGP/eBGP
+    /// classification compares `remote_asn` against this value
+    /// instead of [`BgpDaemonConfig::local_asn`]. None falls back
+    /// to the global. Use case: a single daemon hosting multiple
+    /// iBGP sessions in different ASes (e.g. a router straddling
+    /// 65100 and 65101 with one peer in each).
+    pub local_asn: Option<u32>,
+    /// Per-peer override of the daemon's BGP router-id. When set,
+    /// this peer's OPEN carries this identifier instead of
+    /// [`BgpDaemonConfig::router_id`]. Typically paired with a
+    /// `local_asn` override since real deployments use a unique
+    /// router-id per AS. None falls back to the daemon global.
+    pub router_id: Option<std::net::Ipv4Addr>,
     /// Local source address. Typically a loopback for iBGP, the
     /// connected interface address for eBGP. Optional; if unset
     /// the OS picks one.
@@ -155,6 +170,25 @@ pub struct BgpPeerConfig {
 }
 
 impl BgpPeerConfig {
+    /// Effective local AS for this peer's session. The peer's
+    /// override wins; otherwise we fall back to the daemon's global
+    /// `local_asn`. Used by OPEN construction, is_ebgp
+    /// classification, AS_PATH prepend, and loop detection.
+    pub fn effective_local_asn(&self, global: u32) -> u32 {
+        self.local_asn.unwrap_or(global)
+    }
+
+    /// Effective BGP router-id for this peer's session. Per-peer
+    /// override wins over the daemon's global. Returns `None` only
+    /// when both are unset — caller (`spawn_one_peer`) treats that
+    /// as a configuration error.
+    pub fn effective_router_id(
+        &self,
+        global: Option<std::net::Ipv4Addr>,
+    ) -> Option<std::net::Ipv4Addr> {
+        self.router_id.or(global)
+    }
+
     pub fn redistribute_connected(&self) -> bool {
         self.has_rule(RedistributeProtocol::Connected)
     }
@@ -329,6 +363,18 @@ pub struct BgpPeerYaml {
     pub name: String,
     pub peer_ip: String,
     pub peer_asn: u32,
+    /// Optional per-peer local AS override. When set, the daemon
+    /// advertises this ASN to this neighbor instead of the global
+    /// `bgp.asn`. Lets one daemon host multiple iBGP sessions in
+    /// different ASes. Mirrors Cisco/Juniper `neighbor … local-as`.
+    #[serde(default)]
+    pub local_asn: Option<u32>,
+    /// Optional per-peer router-id override. Pair with `local_asn`
+    /// when straddling multiple ASes — each AS conventionally uses
+    /// its own loopback identifier. Same parse semantics as the
+    /// top-level `bgp.router_id`.
+    #[serde(default)]
+    pub router_id: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
@@ -527,10 +573,19 @@ impl BgpDaemonConfig {
                     route_map: entry.route_map,
                 });
             }
+            let peer_router_id = match &p.router_id {
+                Some(rid) => Some(
+                    rid.parse::<std::net::Ipv4Addr>()
+                        .map_err(|e| ConfigError::InvalidRouterId(rid.clone(), e))?,
+                ),
+                None => None,
+            };
             peers.push(BgpPeerConfig {
                 address,
                 port: None,
                 remote_asn: p.peer_asn,
+                local_asn: p.local_asn,
+                router_id: peer_router_id,
                 source_address,
                 password: None,
                 hold_time: None,
@@ -644,6 +699,8 @@ mod tests {
                 name: "upstream".into(),
                 peer_ip: "192.0.2.1".into(),
                 peer_asn: 65001,
+                local_asn: None,
+                router_id: None,
                 description: None,
                 update_source: Some("10.0.0.1".into()),
                 import_policy: None,
@@ -911,5 +968,81 @@ bgp:
         assert_eq!(cfg.table_id_v4, 0);
         assert_eq!(cfg.table_id_v6, 0);
         assert!(cfg.vrf_name.is_none());
+    }
+
+    #[test]
+    fn per_peer_local_asn_round_trip_via_yaml() {
+        let blob = r#"
+bgp:
+  enabled: true
+  asn: 65100
+  peers:
+    - name: a
+      peer_ip: 10.0.0.2
+      peer_asn: 65100
+    - name: b
+      peer_ip: 10.0.0.3
+      peer_asn: 65101
+      local_asn: 65101
+"#;
+        let router: RouterYaml = serde_yaml::from_str(blob).unwrap();
+        let cfg = BgpDaemonConfig::from_yaml(router.bgp).unwrap();
+        assert_eq!(cfg.peers[0].local_asn, None);
+        assert_eq!(cfg.peers[1].local_asn, Some(65101));
+        // effective_local_asn falls back to global when override absent.
+        assert_eq!(cfg.peers[0].effective_local_asn(cfg.local_asn), 65100);
+        assert_eq!(cfg.peers[1].effective_local_asn(cfg.local_asn), 65101);
+    }
+
+    #[test]
+    fn per_peer_router_id_round_trip_via_yaml() {
+        let blob = r#"
+bgp:
+  enabled: true
+  asn: 65100
+  router_id: 10.0.0.1
+  peers:
+    - name: a
+      peer_ip: 10.0.0.2
+      peer_asn: 65100
+    - name: b
+      peer_ip: 10.0.0.3
+      peer_asn: 65101
+      local_asn: 65101
+      router_id: 10.0.0.99
+"#;
+        let router: RouterYaml = serde_yaml::from_str(blob).unwrap();
+        let cfg = BgpDaemonConfig::from_yaml(router.bgp).unwrap();
+        assert_eq!(cfg.peers[0].router_id, None);
+        assert_eq!(
+            cfg.peers[1].router_id,
+            Some("10.0.0.99".parse().unwrap())
+        );
+        assert_eq!(
+            cfg.peers[0].effective_router_id(cfg.router_id),
+            Some("10.0.0.1".parse().unwrap())
+        );
+        assert_eq!(
+            cfg.peers[1].effective_router_id(cfg.router_id),
+            Some("10.0.0.99".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn per_peer_invalid_router_id_errors() {
+        let blob = r#"
+bgp:
+  enabled: true
+  asn: 65100
+  router_id: 10.0.0.1
+  peers:
+    - name: bad
+      peer_ip: 10.0.0.2
+      peer_asn: 65101
+      router_id: not-an-ip
+"#;
+        let router: RouterYaml = serde_yaml::from_str(blob).unwrap();
+        let err = BgpDaemonConfig::from_yaml(router.bgp).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidRouterId(_, _)));
     }
 }
