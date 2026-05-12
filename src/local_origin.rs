@@ -103,6 +103,22 @@ impl LocalOrigin {
                 if !wanted {
                     continue;
                 }
+                // Per-VRF isolation. Each bgpd instance carries the
+                // `(table_id_v4, table_id_v6)` of the VRF it
+                // belongs to (0/0 for the default-VRF instance).
+                // ribd's InstalledRoutes reply lists every route
+                // across every table — filtering by family-matched
+                // table_id here is what stops the default-VRF
+                // instance from redistributing a customer-VRF
+                // connected route (e.g. a loopback in
+                // customer_vrf) to its default-VRF peers.
+                let want_table = match r.prefix.af {
+                    Af::V4 => config.table_id_v4,
+                    Af::V6 => config.table_id_v6,
+                };
+                if r.table_id != want_table {
+                    continue;
+                }
                 // RibSource::Static maps to OriginClass::Redistribute(Static)
                 // — distinct from OriginClass::Static (which is reserved for
                 // announced_prefixes) so the per-peer redistribute filter can
