@@ -408,15 +408,25 @@ fn print_neighbors(neighbors: &[NeighborStatus]) {
         return;
     }
     println!(
-        "{:<40} {:<10} {:<6} {:<14} {:>10} {:>10} {:>8}",
-        "Peer", "ASN", "Type", "State", "Hold", "v4-RIB-In", "v6-RIB-In"
+        "{:<40} {:<10} {:<6} {:<10} {:<16} {:<14} {:>6} {:>10} {:>10}",
+        "Peer",
+        "ASN",
+        "Type",
+        "Local-AS",
+        "Local-RID",
+        "State",
+        "Hold",
+        "v4-RIB-In",
+        "v6-RIB-In",
     );
     for n in neighbors {
         println!(
-            "{:<40} {:<10} {:<6} {:<14} {:>10} {:>10} {:>8}",
+            "{:<40} {:<10} {:<6} {:<10} {:<16} {:<14} {:>6} {:>10} {:>10}",
             n.address,
             n.asn,
             if n.is_ebgp { "eBGP" } else { "iBGP" },
+            n.local_asn,
+            n.local_router_id,
             n.state,
             n.hold_time,
             n.adj_rib_in_v4_count,

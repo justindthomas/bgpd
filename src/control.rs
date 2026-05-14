@@ -93,6 +93,14 @@ pub struct NeighborStatus {
     pub adj_rib_in_v6_count: usize,
     /// True for eBGP, false for iBGP.
     pub is_ebgp: bool,
+    /// Effective local AS advertised to this neighbor in OPEN —
+    /// the peer's `local_asn` override or, falling back, the
+    /// daemon global. Surfaced so an operator can see at a glance
+    /// which AS each session is presenting in multi-AS setups.
+    pub local_asn: u32,
+    /// Effective BGP router-id advertised in OPEN — same fallback
+    /// chain as `local_asn`.
+    pub local_router_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,6 +163,11 @@ pub struct PeerSnapshot {
     /// prepend, and loop-detection behavior without re-resolving
     /// the override on every UPDATE.
     pub local_asn: u32,
+    /// Effective BGP router-id advertised to this peer in OPEN —
+    /// the peer's override or, falling back, the daemon global.
+    /// Surfaced by `bgpd query neighbors` so an operator can
+    /// confirm what each session is presenting.
+    pub local_router_id: std::net::Ipv4Addr,
     pub state: PeerState,
     pub negotiated_hold_time: u16,
     pub is_ebgp: bool,
@@ -298,6 +311,8 @@ fn neighbor_status(p: &PeerSnapshot) -> NeighborStatus {
         adj_rib_in_v4_count: p.adj_rib_in.v4_unicast.len(),
         adj_rib_in_v6_count: p.adj_rib_in.v6_unicast.len(),
         is_ebgp: p.is_ebgp,
+        local_asn: p.local_asn,
+        local_router_id: p.local_router_id.to_string(),
     }
 }
 
@@ -507,6 +522,7 @@ mod tests {
             address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
             asn: 65001,
             local_asn: 65000,
+            local_router_id: Ipv4Addr::new(10, 0, 0, 1),
             state: PeerState::Established,
             negotiated_hold_time: 90,
             is_ebgp: true,
@@ -517,6 +533,7 @@ mod tests {
             address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)),
             asn: 65002,
             local_asn: 65000,
+            local_router_id: Ipv4Addr::new(10, 0, 0, 1),
             state: PeerState::Idle,
             negotiated_hold_time: 0,
             is_ebgp: true,
@@ -530,11 +547,15 @@ mod tests {
 
     #[test]
     fn neighbor_status_extracts_per_peer_state() {
+        // Use a per-peer local-AS / router-id that differs from
+        // any plausible daemon-global so the test fails loudly
+        // if the wire struct ever drops back to the global.
         let snap = PeerSnapshot {
             id: 1,
             address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
             asn: 65001,
-            local_asn: 65000,
+            local_asn: 65500,
+            local_router_id: Ipv4Addr::new(10, 0, 0, 99),
             state: PeerState::Established,
             negotiated_hold_time: 90,
             is_ebgp: true,
@@ -544,6 +565,8 @@ mod tests {
         assert_eq!(status.asn, 65001);
         assert_eq!(status.state, "Established");
         assert_eq!(status.hold_time, 90);
+        assert_eq!(status.local_asn, 65500);
+        assert_eq!(status.local_router_id, "10.0.0.99");
     }
 
     #[test]
@@ -556,6 +579,7 @@ mod tests {
             address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             asn: 65001,
             local_asn: 65000,
+            local_router_id: Ipv4Addr::new(10, 0, 0, 1),
             state: PeerState::Established,
             negotiated_hold_time: 90,
             is_ebgp: true,
