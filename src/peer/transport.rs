@@ -336,15 +336,29 @@ pub mod vcl_transport {
         msg_tx: mpsc::Sender<Result<Vec<u8>, String>>,
         ready_tx: oneshot::Sender<Result<Option<SocketAddr>, String>>,
     ) {
+        // Serialize the ENTIRE VCL session setup (worker registration +
+        // session create / bind / connect / attr) across all per-peer I/O
+        // threads.
+        //
+        // libvppcom 25.10's worker-pool growth is not thread-safe: registering
+        // a worker reallocs `vcm->workers` and frees the old buffer, while
+        // concurrent threads inside `vppcom_session_create` (and the other
+        // session-setup calls) load `vcm->workers` and dereference it —
+        // racing the realloc faults on a freed pointer. With multiple peers
+        // (a v4 + v6 session) the per-peer threads start together and overlap
+        // their setup, segfaulting bgpd on startup.
+        //
+        // `register_worker_thread`'s own lock only serializes register-vs-
+        // register; it does NOT stop register-vs-session-create. Holding this
+        // process-wide lock across the whole setup makes registration and
+        // session creation strictly sequential. It's dropped before the
+        // steady-state I/O loop, so live traffic isn't serialized — by then
+        // the worker pool is quiescent for this thread.
+        static VCL_SETUP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let setup_guard = VCL_SETUP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
         // Register this dedicated per-peer I/O thread as a VCL worker via
-        // vcl-rs's serialized wrapper, NOT the raw FFI. libvppcom 25.10's
-        // worker-pool growth is not thread-safe: registering reallocs
-        // `vcm->workers`, and a concurrent thread inside
-        // `vppcom_session_create` derefs the freed pointer → GP fault.
-        // With multiple peers (e.g. a v4 + v6 session) the per-peer threads
-        // start together and raced the realloc, segfaulting bgpd on startup.
-        // `register_worker_thread` holds a process-wide lock across the FFI
-        // call (see vcl_rs::app::REGISTER_LOCK) and is idempotent per thread.
+        // vcl-rs's serialized wrapper, NOT the raw FFI.
         vcl_rs::register_worker_thread();
 
         // Create a BLOCKING session for simplicity — reads block
@@ -446,6 +460,10 @@ pub mod vcl_transport {
                 &mut flen,
             );
         }
+
+        // VCL setup complete — release the setup lock before the I/O loop so
+        // steady-state reads/writes across peers are not serialized.
+        drop(setup_guard);
 
         let _ = ready_tx.send(Ok(local_addr));
 
