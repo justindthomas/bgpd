@@ -336,9 +336,16 @@ pub mod vcl_transport {
         msg_tx: mpsc::Sender<Result<Vec<u8>, String>>,
         ready_tx: oneshot::Sender<Result<Option<SocketAddr>, String>>,
     ) {
-        unsafe {
-            vcl_rs::ffi::vppcom_worker_register();
-        }
+        // Register this dedicated per-peer I/O thread as a VCL worker via
+        // vcl-rs's serialized wrapper, NOT the raw FFI. libvppcom 25.10's
+        // worker-pool growth is not thread-safe: registering reallocs
+        // `vcm->workers`, and a concurrent thread inside
+        // `vppcom_session_create` derefs the freed pointer → GP fault.
+        // With multiple peers (e.g. a v4 + v6 session) the per-peer threads
+        // start together and raced the realloc, segfaulting bgpd on startup.
+        // `register_worker_thread` holds a process-wide lock across the FFI
+        // call (see vcl_rs::app::REGISTER_LOCK) and is idempotent per thread.
+        vcl_rs::register_worker_thread();
 
         // Create a BLOCKING session for simplicity — reads block
         // on the thread, which is fine since it's dedicated.
