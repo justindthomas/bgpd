@@ -118,7 +118,7 @@ pub struct BgpInstance {
     parsed_aggregates_v4: Vec<(Prefix4, bool)>,
     parsed_aggregates_v6: Vec<(Prefix6, bool)>,
     #[cfg(feature = "vcl")]
-    vcl_reactor: Option<vcl_rs::VclReactor>,
+    vcl_enabled: bool,
 }
 
 impl BgpInstance {
@@ -191,7 +191,7 @@ impl BgpInstance {
             parsed_aggregates_v4,
             parsed_aggregates_v6,
             #[cfg(feature = "vcl")]
-            vcl_reactor: None,
+            vcl_enabled: false,
         };
         instance.rebuild_local_pseudo_rib();
         instance.recompute_aggregates();
@@ -329,12 +329,11 @@ impl BgpInstance {
         }
     }
 
-    /// Set the VCL reactor for VPP TCP stack integration. When
-    /// set, all peer sessions use VclTransport instead of kernel
-    /// TCP. Call before `spawn_peers`.
+    /// Enable VCL transport: peer sessions use VclTransport (VPP TCP
+    /// stack) instead of kernel TCP. Call before `spawn_peers`.
     #[cfg(feature = "vcl")]
-    pub fn set_vcl_reactor(&mut self, reactor: vcl_rs::VclReactor) {
-        self.vcl_reactor = Some(reactor);
+    pub fn set_vcl_enabled(&mut self) {
+        self.vcl_enabled = true;
     }
 
     /// Spawn a Peer task for every configured peer. After this
@@ -387,8 +386,8 @@ impl BgpInstance {
         let mut peer = Peer::new(fsm_config, control_rx, state_tx);
         peer.set_connect_info(connect_info);
         #[cfg(feature = "vcl")]
-        if let Some(reactor) = &self.vcl_reactor {
-            peer.set_vcl_reactor(reactor.clone());
+        if self.vcl_enabled {
+            peer.set_vcl_enabled();
         }
 
         // Seed the snapshot with this peer in Idle state so

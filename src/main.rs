@@ -296,9 +296,13 @@ async fn run_daemon(args: &RunArgs) -> anyhow::Result<()> {
     let _vcl_app = if args.use_vcl {
         let app = vcl_rs::VclApp::init("bgpd")
             .map_err(|e| anyhow::anyhow!("VCL init failed: {}", e))?;
-        let reactor = vcl_rs::VclReactor::new()
-            .map_err(|e| anyhow::anyhow!("VCL reactor failed: {}", e))?;
-        instance.set_vcl_reactor(reactor);
+        // No VclReactor: bgpd's VclTransport does its own blocking libvppcom
+        // I/O on dedicated per-peer threads and never used the reactor's event
+        // loop. The reactor's 10ms periodic-drain tick called vppcom_epoll_wait
+        // concurrently with those threads registering VCL workers, racing
+        // libvppcom 25.10's non-thread-safe worker-pool realloc and
+        // segfaulting bgpd on startup.
+        instance.set_vcl_enabled();
         tracing::info!("VCL transport enabled — BGP sessions via VPP TCP stack");
         Some(app)
     } else {

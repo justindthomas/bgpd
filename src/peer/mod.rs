@@ -85,11 +85,11 @@ pub struct Peer {
     /// Connection parameters used by `Action::InitiateTcpConnect`.
     /// `None` in test mode where the transport is injected.
     connect_info: Option<PeerConnectInfo>,
-    /// When set, the peer uses VPP's VCL TCP stack instead of
+    /// When true, the peer uses VPP's VCL TCP stack instead of
     /// kernel TCP. Initialized by the instance layer when the
     /// daemon is configured for VCL mode.
     #[cfg(feature = "vcl")]
-    vcl_reactor: Option<vcl_rs::VclReactor>,
+    vcl_enabled: bool,
 }
 
 /// Control commands the parent task can send to the driver loop.
@@ -152,7 +152,7 @@ impl Peer {
             state_tx,
             connect_info: None,
             #[cfg(feature = "vcl")]
-            vcl_reactor: None,
+            vcl_enabled: false,
         }
     }
 
@@ -164,8 +164,8 @@ impl Peer {
     }
 
     #[cfg(feature = "vcl")]
-    pub fn set_vcl_reactor(&mut self, reactor: vcl_rs::VclReactor) {
-        self.vcl_reactor = Some(reactor);
+    pub fn set_vcl_enabled(&mut self) {
+        self.vcl_enabled = true;
     }
 
     pub fn state(&self) -> PeerState {
@@ -385,16 +385,15 @@ impl Peer {
                     );
                     return Vec::new();
                 };
-                // Use VCL transport when a reactor is configured,
-                // otherwise fall back to kernel TCP.
+                // Use VCL transport when VCL is enabled, otherwise
+                // fall back to kernel TCP.
                 #[cfg(feature = "vcl")]
-                if let Some(reactor) = &self.vcl_reactor {
+                if self.vcl_enabled {
                     match transport::VclTransport::connect(
                         info.peer,
                         info.source,
                         info.password.as_deref(),
                         info.timeout,
-                        reactor.clone(),
                     )
                     .await
                     {

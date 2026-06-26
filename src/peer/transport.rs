@@ -282,7 +282,6 @@ pub mod vcl_transport {
             source: Option<SocketAddr>,
             _password: Option<&str>,
             _connect_timeout: Duration,
-            _reactor: vcl_rs::VclReactor,
         ) -> Result<Self, TransportError> {
             if _password.is_some() {
                 tracing::warn!(
