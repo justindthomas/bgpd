@@ -171,7 +171,7 @@ async fn driver_reaches_established_and_delivers_update() {
         match tokio::time::timeout(Duration::from_millis(200), state_rx.recv()).await {
             Ok(Some(PeerStateUpdate::SessionEstablished)) => saw_established = true,
             Ok(Some(PeerStateUpdate::UpdateReceived(_))) => saw_update = true,
-            Ok(Some(PeerStateUpdate::StateChanged(_))) => {}
+            Ok(Some(PeerStateUpdate::StateChanged(..))) => {}
             Ok(None) => break,
             Err(_) => {}
         }

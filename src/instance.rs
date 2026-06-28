@@ -870,10 +870,11 @@ impl BgpInstance {
         event: PeerStateUpdate,
     ) -> Result<()> {
         match event {
-            PeerStateUpdate::StateChanged(new_state) => {
+            PeerStateUpdate::StateChanged(new_state, negotiated_hold) => {
                 let mut snap = self.snapshot.lock().await;
                 if let Some(p) = snap.peers.iter_mut().find(|p| p.id == peer_id) {
                     p.state = new_state;
+                    p.negotiated_hold_time = negotiated_hold;
                 }
                 if matches!(new_state, PeerState::Idle) {
                     // Session went down — drop this peer's

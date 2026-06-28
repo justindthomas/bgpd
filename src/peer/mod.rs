@@ -121,7 +121,10 @@ pub enum PeerControl {
 /// State updates the driver task publishes to the parent.
 #[derive(Debug, Clone)]
 pub enum PeerStateUpdate {
-    StateChanged(PeerState),
+    /// New FSM state plus the currently-negotiated hold time (0 until the
+    /// OPEN exchange completes). Lets the parent's snapshot reflect the live
+    /// negotiated value rather than the init-0 placeholder.
+    StateChanged(PeerState, u16),
     SessionEstablished,
     UpdateReceived(Update),
 }
@@ -360,7 +363,10 @@ impl Peer {
         if self.fsm.state != prev_state {
             let _ = self
                 .state_tx
-                .send(PeerStateUpdate::StateChanged(self.fsm.state))
+                .send(PeerStateUpdate::StateChanged(
+                    self.fsm.state,
+                    self.fsm.negotiated_hold_time,
+                ))
                 .await;
         }
     }
