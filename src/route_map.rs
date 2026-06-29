@@ -64,8 +64,12 @@ pub struct BgpSetYaml {
     /// Remove these communities (if present).
     #[serde(default)]
     pub community_remove: Vec<String>,
-    /// Replace LOCAL_PREF with this value.
-    #[serde(default)]
+    /// Replace LOCAL_PREF with this value. ecrd serialises this set
+    /// clause under `local_preference` (its RouteMapSet field name) when
+    /// it normalises router.yaml for the daemons, so accept that spelling
+    /// too — otherwise the value silently parses as None and the set is
+    /// a no-op.
+    #[serde(default, alias = "local_preference")]
     pub local_pref: Option<u32>,
 }
 

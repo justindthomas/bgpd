@@ -1517,21 +1517,29 @@ fn rebuild_loc_rib(
                 .unwrap_or(&deny);
             let mut rib = AdjRibIn::new();
             for (prefix, route) in &p.adj_rib_in.v4_unicast {
-                if import.permits_v4(
+                if let Some(actions) = import.import_v4(
                     prefix,
                     &route.path_attributes,
                     crate::policy::source_for_route(route),
                 ) {
-                    rib.insert_v4(*prefix, route.clone());
+                    let mut r = route.clone();
+                    if let Some(lp) = actions.local_pref {
+                        r.set_local_pref(lp);
+                    }
+                    rib.insert_v4(*prefix, r);
                 }
             }
             for (prefix, route) in &p.adj_rib_in.v6_unicast {
-                if import.permits_v6(
+                if let Some(actions) = import.import_v6(
                     prefix,
                     &route.path_attributes,
                     crate::policy::source_for_route(route),
                 ) {
-                    rib.insert_v6(*prefix, route.clone());
+                    let mut r = route.clone();
+                    if let Some(lp) = actions.local_pref {
+                        r.set_local_pref(lp);
+                    }
+                    rib.insert_v6(*prefix, r);
                 }
             }
             (p.id, rib)

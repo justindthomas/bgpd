@@ -181,6 +181,15 @@ impl StoredRoute {
         })
     }
 
+    /// Replace (or insert) the LOCAL_PREF path attribute. Used to apply
+    /// an import route-map's `set local-preference` when materialising
+    /// Loc-RIB from the (pre-policy) Adj-RIB-In.
+    pub fn set_local_pref(&mut self, lp: u32) {
+        self.path_attributes
+            .retain(|a| !matches!(a, PathAttribute::LocalPref(_)));
+        self.path_attributes.push(PathAttribute::LocalPref(lp));
+    }
+
     pub fn med(&self) -> Option<u32> {
         self.path_attributes.iter().find_map(|a| match a {
             PathAttribute::MultiExitDisc(med) => Some(*med),

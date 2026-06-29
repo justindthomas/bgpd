@@ -69,7 +69,7 @@ impl Policy {
             Policy::DenyAll => false,
             Policy::RouteMap(map) => {
                 let pfx = ribd_proto::Prefix::v4(prefix.addr, prefix.len);
-                evaluate_route_map(map, pfx, source, path_attrs)
+                evaluate_route_map(map, pfx, source, path_attrs).is_some()
             }
         }
     }
@@ -83,6 +83,45 @@ impl Policy {
         match self {
             Policy::AcceptAll => true,
             Policy::DenyAll => false,
+            Policy::RouteMap(map) => {
+                let pfx = ribd_proto::Prefix::v6(prefix.addr, prefix.len);
+                evaluate_route_map(map, pfx, source, path_attrs).is_some()
+            }
+        }
+    }
+
+    /// Import-side evaluation. Returns `None` if the route is denied,
+    /// or `Some(actions)` if permitted — carrying the matched
+    /// statement's `set:` clauses (e.g. `set local-preference`) for the
+    /// caller to apply to the route. Unlike [`Policy::permits_v4`],
+    /// which only answers the filter question, this is how an import
+    /// route-map's set-clauses actually take effect.
+    pub fn import_v4(
+        &self,
+        prefix: &Prefix4,
+        path_attrs: &[PathAttribute],
+        source: Source,
+    ) -> Option<ImportActions> {
+        match self {
+            Policy::AcceptAll => Some(ImportActions::default()),
+            Policy::DenyAll => None,
+            Policy::RouteMap(map) => {
+                let pfx = ribd_proto::Prefix::v4(prefix.addr, prefix.len);
+                evaluate_route_map(map, pfx, source, path_attrs)
+            }
+        }
+    }
+
+    /// IPv6 counterpart of [`Policy::import_v4`].
+    pub fn import_v6(
+        &self,
+        prefix: &Prefix6,
+        path_attrs: &[PathAttribute],
+        source: Source,
+    ) -> Option<ImportActions> {
+        match self {
+            Policy::AcceptAll => Some(ImportActions::default()),
+            Policy::DenyAll => None,
             Policy::RouteMap(map) => {
                 let pfx = ribd_proto::Prefix::v6(prefix.addr, prefix.len);
                 evaluate_route_map(map, pfx, source, path_attrs)
@@ -158,12 +197,25 @@ pub fn source_for_route(stored: &StoredRoute) -> Source {
 /// separate so [`Policy::permits_v4`] / [`Policy::permits_v6`]
 /// have a self-contained call path. No-statement-matched defaults
 /// to deny.
+/// Set-clause actions applied to a route when an import route-map
+/// permits it. Empty for [`Policy::AcceptAll`] or a permit statement
+/// with no `set:` clause. (Export-side set-clauses are not applied
+/// yet — only the import path threads these through.)
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ImportActions {
+    pub local_pref: Option<u32>,
+}
+
+/// Walk a route-map and return the outcome for the first matching
+/// statement: `None` if denied (or nothing matched — route-maps are
+/// deny-by-default), `Some(actions)` if permitted, carrying that
+/// statement's `set:` clauses for the caller to apply.
 fn evaluate_route_map(
     map: &BgpRouteMap,
     prefix: ribd_proto::Prefix,
     source: Source,
     path_attrs: &[PathAttribute],
-) -> bool {
+) -> Option<ImportActions> {
     struct Ctx {
         prefix: ribd_proto::Prefix,
         source: Source,
@@ -184,9 +236,14 @@ fn evaluate_route_map(
         if !crate::route_map::evaluate_bgp_match(&stmt.match_.extra, path_attrs) {
             continue;
         }
-        return matches!(stmt.action, ribd_routemap::Action::Permit);
+        return match stmt.action {
+            ribd_routemap::Action::Permit => Some(ImportActions {
+                local_pref: stmt.set.extra.local_pref,
+            }),
+            _ => None,
+        };
     }
-    false
+    None
 }
 
 #[cfg(test)]
@@ -266,6 +323,34 @@ statements:
         assert!(p.permits_v4(&p4(23, 0, 0, 0, 8), &[], Source::Bgp));
         assert!(!p.permits_v4(&p4(23, 1, 2, 0, 24), &[], Source::Bgp));
         assert!(!p.permits_v4(&p4(10, 0, 0, 0, 8), &[], Source::Bgp));
+    }
+
+    #[test]
+    fn import_route_map_surfaces_local_pref_set() {
+        // A permitting statement carrying `set: local_preference: 200`
+        // (ecrd's spelling, accepted via the serde alias) surfaces through
+        // import_v4 so rebuild_loc_rib can apply it to the route; the plain
+        // permits_v4 filter view still agrees.
+        let map = compile_map(
+            r#"
+name: upstream-in
+statements:
+  - seq: 10
+    action: permit
+    match:
+      prefix_list: ["10.99.0.0/24"]
+    set:
+      local_preference: 200
+"#,
+        );
+        let p = Policy::RouteMap(map);
+        let actions = p
+            .import_v4(&p4(10, 99, 0, 0, 24), &[], Source::Bgp)
+            .expect("10.99.0.0/24 permitted");
+        assert_eq!(actions.local_pref, Some(200));
+        assert!(p.permits_v4(&p4(10, 99, 0, 0, 24), &[], Source::Bgp));
+        // A prefix the map doesn't permit is denied (implicit deny → None).
+        assert!(p.import_v4(&p4(10, 0, 0, 0, 8), &[], Source::Bgp).is_none());
     }
 
     #[test]
