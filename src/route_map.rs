@@ -66,10 +66,13 @@ pub struct BgpSetYaml {
     pub community_remove: Vec<String>,
     /// Replace LOCAL_PREF with this value. ecrd serialises this set
     /// clause under `local_preference` (its RouteMapSet field name) when
-    /// it normalises router.yaml for the daemons, so accept that spelling
-    /// too — otherwise the value silently parses as None and the set is
-    /// a no-op.
-    #[serde(default, alias = "local_preference")]
+    /// it normalises router.yaml for the daemons. BgpSetYaml is
+    /// `#[serde(flatten)]`'d into SetYaml, and serde does NOT honour a
+    /// field `alias` through `flatten` (serde issue #1504) — only the
+    /// canonical/`rename` name is matched. So `rename` to the on-disk
+    /// key; otherwise the value silently parses as None and the set is a
+    /// no-op (the bug that left applied local-pref unset).
+    #[serde(default, rename = "local_preference")]
     pub local_pref: Option<u32>,
 }
 
