@@ -199,7 +199,7 @@ impl BgpInstance {
         // visible in queries before any peer sends an UPDATE.
         {
             let mut snap = instance.snapshot.lock().await;
-            let loc = rebuild_loc_rib(&snap.peers, &instance.local_pseudo_rib);
+            let loc = rebuild_loc_rib(&snap.peers, &instance.local_pseudo_rib, &instance.peer_policies);
             snap.loc_rib = loc;
         }
         Ok((instance, control_tx))
@@ -687,7 +687,7 @@ impl BgpInstance {
         self.recompute_aggregates();
         {
             let mut snap = self.snapshot.lock().await;
-            let loc = rebuild_loc_rib(&snap.peers, &self.local_pseudo_rib);
+            let loc = rebuild_loc_rib(&snap.peers, &self.local_pseudo_rib, &self.peer_policies);
             snap.loc_rib = loc;
         }
         self.push_full().await?;
@@ -783,42 +783,16 @@ impl BgpInstance {
             );
             let new_policy = crate::policy::PeerPolicy { import, export };
 
-            // Unconditionally update + re-filter. Policy types
-            // don't cheaply compare (route-maps wrap statements);
-            // re-filtering an already-matching set is idempotent
-            // and cheap.
-            self.peer_policies.insert(pid, new_policy.clone());
-
-            let mut snap = self.snapshot.lock().await;
-            if let Some(peer) = snap.peers.iter_mut().find(|p| p.id == pid) {
-                let before = peer.adj_rib_in.len();
-                let import = &new_policy.import;
-                peer.adj_rib_in.v4_unicast.retain(|prefix, stored| {
-                    import.permits_v4(
-                        prefix,
-                        &stored.path_attributes,
-                        crate::policy::source_for_route(stored),
-                    )
-                });
-                peer.adj_rib_in.v6_unicast.retain(|prefix, stored| {
-                    import.permits_v6(
-                        prefix,
-                        &stored.path_attributes,
-                        crate::policy::source_for_route(stored),
-                    )
-                });
-                let after = peer.adj_rib_in.len();
-                if before != after {
-                    tracing::info!(
-                        peer = %new_p.address,
-                        peer_id = pid,
-                        before,
-                        after,
-                        "reload: import policy dropped prefixes"
-                    );
-                    changed = true;
-                }
-            }
+            // Unconditionally update the resolved policy. Policy types
+            // don't cheaply compare (route-maps wrap statements), so we
+            // just mark the reload changed and let reload_config's final
+            // rebuild_loc_rib re-apply it. Adj-RIB-In is pre-policy and
+            // is intentionally left untouched: a route denied earlier
+            // under an empty/loading policy reappears once the route-map
+            // is present, and a tightened policy drops it — both happen
+            // for free in the rebuild.
+            self.peer_policies.insert(pid, new_policy);
+            changed = true;
         }
 
         // Add brand-new peers.
@@ -883,7 +857,7 @@ impl BgpInstance {
                     if let Some(p) = snap.peers.iter_mut().find(|p| p.id == peer_id) {
                         p.adj_rib_in = AdjRibIn::new();
                     }
-                    let loc = rebuild_loc_rib(&snap.peers, &self.local_pseudo_rib);
+                    let loc = rebuild_loc_rib(&snap.peers, &self.local_pseudo_rib, &self.peer_policies);
                     snap.loc_rib = loc;
                     drop(snap);
                     self.push_full().await?;
@@ -936,16 +910,15 @@ impl BgpInstance {
                 self.advertise_to_peer(peer_id).await;
             }
             PeerStateUpdate::UpdateReceived(update) => {
-                let import_policy = self
-                    .peer_policies
-                    .get(&peer_id)
-                    .map(|pp| pp.import.clone())
-                    .unwrap_or_default();
                 let snap = self.snapshot.clone();
                 {
                     let mut snap = snap.lock().await;
-                    apply_update_to_peer(&mut snap, peer_id, update, &import_policy)?;
-                    let loc = rebuild_loc_rib(&snap.peers, &self.local_pseudo_rib);
+                    apply_update_to_peer(&mut snap, peer_id, update)?;
+                    let loc = rebuild_loc_rib(
+                        &snap.peers,
+                        &self.local_pseudo_rib,
+                        &self.peer_policies,
+                    );
                     snap.loc_rib = loc;
                 }
                 self.push_full().await?;
@@ -1072,7 +1045,7 @@ impl BgpInstance {
         ctx: &AdvertiseCtx,
     ) -> (AdvertisedPrefixes, OutboundGroups) {
         let snap = self.snapshot.lock().await;
-        let loc = rebuild_loc_rib(&snap.peers, &self.local_pseudo_rib);
+        let loc = rebuild_loc_rib(&snap.peers, &self.local_pseudo_rib, &self.peer_policies);
         drop(snap);
 
         let suppressed_v4: Vec<&Prefix4> = self
@@ -1379,7 +1352,6 @@ fn apply_update_to_peer(
     snap: &mut SpeakerSnapshot,
     peer_id: PeerId,
     update: Update,
-    import_policy: &crate::policy::Policy,
 ) -> Result<()> {
     let peer = snap
         .peers
@@ -1425,15 +1397,10 @@ fn apply_update_to_peer(
             peer.address,
             ipv4_or_unspec(peer.address),
         );
-        let import_source = crate::policy::source_for_route(&stored);
+        // Pre-policy Adj-RIB-In: store every received route. Import
+        // policy is applied later in rebuild_loc_rib (see its note).
         for prefix in &update.nlri_v4 {
-            if import_policy.permits_v4(
-                prefix,
-                &stored.path_attributes,
-                import_source,
-            ) {
-                peer.adj_rib_in.insert_v4(*prefix, stored.clone());
-            }
+            peer.adj_rib_in.insert_v4(*prefix, stored.clone());
         }
     } else if has_local_asn_in_as_path && !update.nlri_v4.is_empty() {
         tracing::debug!(
@@ -1470,15 +1437,8 @@ fn apply_update_to_peer(
             peer.address,
             ipv4_or_unspec(peer.address),
         );
-        let import_source = crate::policy::source_for_route(&stored);
         for prefix in &v6_announce {
-            if import_policy.permits_v6(
-                prefix,
-                &stored.path_attributes,
-                import_source,
-            ) {
-                peer.adj_rib_in.insert_v6(*prefix, stored.clone());
-            }
+            peer.adj_rib_in.insert_v6(*prefix, stored.clone());
         }
     } else if has_local_asn_in_as_path && !v6_announce.is_empty() {
         tracing::debug!(
@@ -1533,11 +1493,54 @@ fn parse_v6_prefixes(buf: &[u8]) -> Vec<crate::packet::update::Prefix6> {
 /// Local-origin entries compete with peer-learned routes via
 /// the standard best-path tiebreakers; for prefixes nobody else
 /// advertises, the local origin wins by default.
-fn rebuild_loc_rib(peers: &[PeerSnapshot], local: &AdjRibIn) -> LocRib {
-    let mut inputs: Vec<(PeerId, &AdjRibIn)> = Vec::with_capacity(peers.len() + 1);
-    for p in peers {
-        inputs.push((p.id, &p.adj_rib_in));
-    }
+fn rebuild_loc_rib(
+    peers: &[PeerSnapshot],
+    local: &AdjRibIn,
+    peer_policies: &std::collections::HashMap<PeerId, crate::policy::PeerPolicy>,
+) -> LocRib {
+    // RFC 4271: Adj-RIB-In is *pre*-policy; the import policy is applied
+    // here, when computing Loc-RIB. Keeping Adj-RIB-In unfiltered means a
+    // policy reload — or a route-map that only loads *after* the peer's
+    // first UPDATEs (boot race: bgpd reads router.yaml before ecrd has
+    // written the route-map, so the policy is momentarily empty and
+    // RFC 8212 denies everything) — re-evaluates the full received set on
+    // the next rebuild instead of silently losing routes forever. A peer
+    // with no resolved policy yet defaults to deny (RFC 8212); local-
+    // origin routes bypass import policy entirely.
+    let deny = crate::policy::Policy::default();
+    let filtered: Vec<(PeerId, AdjRibIn)> = peers
+        .iter()
+        .map(|p| {
+            let import = peer_policies
+                .get(&p.id)
+                .map(|pp| &pp.import)
+                .unwrap_or(&deny);
+            let mut rib = AdjRibIn::new();
+            for (prefix, route) in &p.adj_rib_in.v4_unicast {
+                if import.permits_v4(
+                    prefix,
+                    &route.path_attributes,
+                    crate::policy::source_for_route(route),
+                ) {
+                    rib.insert_v4(*prefix, route.clone());
+                }
+            }
+            for (prefix, route) in &p.adj_rib_in.v6_unicast {
+                if import.permits_v6(
+                    prefix,
+                    &route.path_attributes,
+                    crate::policy::source_for_route(route),
+                ) {
+                    rib.insert_v6(*prefix, route.clone());
+                }
+            }
+            (p.id, rib)
+        })
+        .collect();
+    let mut inputs: Vec<(PeerId, &AdjRibIn)> = filtered
+        .iter()
+        .map(|(id, r)| (*id, r))
+        .collect();
     inputs.push((LOCAL_PEER_ID, local));
     LocRib::rebuild(&inputs)
 }
@@ -2085,7 +2088,7 @@ mod tests {
             ],
             nlri_v4: vec![p4(192, 0, 2, 0, 24), p4(198, 51, 100, 0, 24)],
         };
-        apply_update_to_peer(&mut snap, 1, update, &crate::policy::Policy::AcceptAll).unwrap();
+        apply_update_to_peer(&mut snap, 1, update).unwrap();
         assert_eq!(snap.peers[0].adj_rib_in.v4_unicast.len(), 2);
     }
 
@@ -2110,7 +2113,7 @@ mod tests {
             path_attributes: Vec::new(),
             nlri_v4: Vec::new(),
         };
-        apply_update_to_peer(&mut snap, 1, update, &crate::policy::Policy::AcceptAll).unwrap();
+        apply_update_to_peer(&mut snap, 1, update).unwrap();
         assert!(snap.peers[0].adj_rib_in.v4_unicast.is_empty());
     }
 
@@ -2473,7 +2476,7 @@ statements:
             ],
             nlri_v4: vec![p4(192, 0, 2, 0, 24)],
         };
-        apply_update_to_peer(&mut snap, 1, update, &crate::policy::Policy::AcceptAll).unwrap();
+        apply_update_to_peer(&mut snap, 1, update).unwrap();
         assert!(
             snap.peers[0].adj_rib_in.v4_unicast.is_empty(),
             "eBGP loop must be dropped"
@@ -2504,7 +2507,7 @@ statements:
             ],
             nlri_v4: vec![p4(192, 0, 2, 0, 24)],
         };
-        apply_update_to_peer(&mut snap, 1, update, &crate::policy::Policy::AcceptAll).unwrap();
+        apply_update_to_peer(&mut snap, 1, update).unwrap();
         assert!(
             snap.peers[0].adj_rib_in.v4_unicast.is_empty(),
             "per-peer local-AS in AS_PATH must trigger loop drop"
@@ -2527,7 +2530,7 @@ statements:
             ],
             nlri_v4: vec![p4(192, 0, 2, 0, 24)],
         };
-        apply_update_to_peer(&mut snap, 1, update, &crate::policy::Policy::AcceptAll).unwrap();
+        apply_update_to_peer(&mut snap, 1, update).unwrap();
         assert_eq!(
             snap.peers[0].adj_rib_in.v4_unicast.len(),
             1,
@@ -2556,30 +2559,70 @@ statements:
             ],
             nlri_v4: vec![p4(192, 0, 2, 0, 24)],
         };
-        apply_update_to_peer(&mut snap, 1, update, &crate::policy::Policy::AcceptAll).unwrap();
+        apply_update_to_peer(&mut snap, 1, update).unwrap();
         assert_eq!(snap.peers[0].adj_rib_in.v4_unicast.len(), 1);
     }
 
     #[test]
-    fn apply_update_drops_routes_rejected_by_import_policy() {
-        // RFC 8212 default-deny: with Policy::DenyAll an eBGP
-        // peer's inbound UPDATE is discarded even when the
-        // AS_PATH is clean.
+    fn import_policy_applied_at_loc_rib_and_reload_recovers() {
+        // Adj-RIB-In is pre-policy: a received route is stored regardless
+        // of import policy, and the policy is applied when Loc-RIB is
+        // built. This is what lets a route that arrived while the route-
+        // map was still empty (RFC 8212 deny-all) reappear once the
+        // policy loads — the fix for the intermittent test_13/test_19
+        // BGP failures (Adj-RIB-In was previously post-policy, so a
+        // route denied at ingest was lost forever, even after reload).
+        use std::collections::HashMap;
         let mut snap = snapshot_with_peer();
+        let pfx = p4(192, 0, 2, 0, 24);
         let update = Update {
             withdrawn_v4: Vec::new(),
             path_attributes: vec![
                 PathAttribute::Origin(Origin::Igp),
+                // AS_PATH [65001] is loop-free here (local ASN is 65000).
                 PathAttribute::AsPath(vec![AsPathSegment {
                     seg_type: AsPathSegmentType::AsSequence,
                     asns: vec![65001],
                 }]),
                 PathAttribute::NextHop(Ipv4Addr::new(10, 0, 0, 2)),
             ],
-            nlri_v4: vec![p4(192, 0, 2, 0, 24)],
+            nlri_v4: vec![pfx],
         };
-        apply_update_to_peer(&mut snap, 1, update, &crate::policy::Policy::DenyAll).unwrap();
-        assert!(snap.peers[0].adj_rib_in.v4_unicast.is_empty());
+        apply_update_to_peer(&mut snap, 1, update).unwrap();
+        // Stored pre-policy, before any policy is consulted.
+        assert!(snap.peers[0].adj_rib_in.v4_unicast.contains_key(&pfx));
+
+        let empty_local = AdjRibIn::new();
+        let mut policies: HashMap<PeerId, crate::policy::PeerPolicy> = HashMap::new();
+
+        // Deny-all import (e.g. route-map not loaded yet) → not in Loc-RIB.
+        policies.insert(
+            1,
+            crate::policy::PeerPolicy {
+                import: crate::policy::Policy::DenyAll,
+                export: crate::policy::Policy::AcceptAll,
+            },
+        );
+        let loc = rebuild_loc_rib(&snap.peers, &empty_local, &policies);
+        assert!(
+            loc.v4_unicast.is_empty(),
+            "deny-all import must keep the route out of Loc-RIB"
+        );
+
+        // Policy now permits (route-map loaded on reload) → the route
+        // recovers from the still-present Adj-RIB-In, no re-advertise.
+        policies.insert(
+            1,
+            crate::policy::PeerPolicy {
+                import: crate::policy::Policy::AcceptAll,
+                export: crate::policy::Policy::AcceptAll,
+            },
+        );
+        let loc = rebuild_loc_rib(&snap.peers, &empty_local, &policies);
+        assert!(
+            loc.v4_unicast.contains_key(&pfx),
+            "permitting import must surface the pre-policy route in Loc-RIB"
+        );
     }
 
     #[test]
@@ -2603,7 +2646,7 @@ statements:
             path_attributes: Vec::new(),
             nlri_v4: Vec::new(),
         };
-        apply_update_to_peer(&mut snap, 1, update, &crate::policy::Policy::DenyAll).unwrap();
+        apply_update_to_peer(&mut snap, 1, update).unwrap();
         assert!(snap.peers[0].adj_rib_in.v4_unicast.is_empty());
     }
 
@@ -2880,7 +2923,12 @@ statements:
             snap.peers.push(p);
         }
         let empty_local = AdjRibIn::new();
-        let loc = rebuild_loc_rib(&snap.peers, &empty_local);
+        let mut policies: std::collections::HashMap<PeerId, crate::policy::PeerPolicy> =
+            std::collections::HashMap::new();
+        for id in [1u32, 2u32] {
+            policies.insert(id, crate::policy::PeerPolicy::ibgp_default()); // accept-all import
+        }
+        let loc = rebuild_loc_rib(&snap.peers, &empty_local, &policies);
         assert_eq!(loc.v4_unicast.len(), 1);
         assert_eq!(loc.v4_unicast.values().next().unwrap().winner.peer_id, 2);
     }
