@@ -343,6 +343,29 @@ async fn run_daemon(args: &RunArgs) -> anyhow::Result<()> {
         }
     });
 
+    // SIGTERM (ecrd/systemd restart) triggers a graceful shutdown:
+    // close every BGP session cleanly (TCP FIN) so the remote drops it
+    // immediately. Otherwise the restarted bgpd's reconnect collides
+    // with the remote's still-Established stale session and flaps until
+    // the hold timer expires — the intermittent BGP route flake.
+    let shutdown_tx = instance_control_tx.clone();
+    tokio::spawn(async move {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("failed to register SIGTERM handler: {}", e);
+                return;
+            }
+        };
+        if sigterm.recv().await.is_some() {
+            tracing::info!("SIGTERM received — graceful shutdown");
+            let _ = shutdown_tx
+                .send(bgpd::instance::InstanceControl::Shutdown)
+                .await;
+        }
+    });
+
     instance.run().await;
     drop(instance_control_tx);
     Ok(())

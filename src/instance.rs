@@ -63,6 +63,15 @@ const IDLE_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 #[derive(Debug)]
 pub enum InstanceControl {
     Reload,
+    /// Graceful shutdown: cleanly close every peer's BGP session
+    /// (TCP FIN to the remote) before the process exits, so the
+    /// remote drops the session immediately instead of holding it for
+    /// the hold timer. Without this, an ecrd-triggered restart leaves
+    /// a stale half-open session in VPP's stack; the remote keeps it
+    /// alive and rejects bgpd's reconnect as a connection collision
+    /// ("No AFI/SAFI activated"), flapping until the hold timer
+    /// expires — the root cause of the intermittent BGP route flake.
+    Shutdown,
 }
 
 pub struct BgpInstance {
@@ -580,11 +589,31 @@ impl BgpInstance {
                                 tracing::warn!("instance reload failed: {}", e);
                             }
                         }
+                        InstanceControl::Shutdown => {
+                            tracing::info!(
+                                peers = self.peer_controls.len(),
+                                "shutdown requested — closing BGP sessions cleanly"
+                            );
+                            // Tell every peer driver to Stop; the FSM's
+                            // go_idle drops the transport, which sends a
+                            // VCL Close (TCP FIN) so the remote tears the
+                            // session down immediately rather than holding
+                            // it for the hold timer.
+                            for (pid, tx) in &self.peer_controls {
+                                if tx.send(PeerControl::Stop).await.is_err() {
+                                    tracing::debug!(peer_id = pid, "peer already gone");
+                                }
+                            }
+                            // Give the peer tasks a beat to flush the FIN
+                            // before the process exits.
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            break;
+                        }
                     }
                 }
             }
         }
-        tracing::info!("BgpInstance shut down (events channel closed)");
+        tracing::info!("BgpInstance shut down");
     }
 
     /// Re-read the YAML config, re-build the local-origin set,
