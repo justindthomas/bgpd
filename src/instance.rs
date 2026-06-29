@@ -1904,7 +1904,7 @@ fn resolve_peer_policy(
     let Some(name) = name else {
         return default.clone();
     };
-    match crate::policy::resolve_policy_name(name, route_maps) {
+    let resolved = match crate::policy::resolve_policy_name(name, route_maps) {
         Some(p) => p,
         None => {
             tracing::warn!(
@@ -1915,7 +1915,31 @@ fn resolve_peer_policy(
             );
             default.clone()
         }
+    };
+    // bgpd applies route-map `set` clauses only on the IMPORT side, and
+    // only `set local-preference` (Policy::import_v4). Export-side set
+    // clauses (community, metric/MED, as-path-prepend) parse but are not
+    // yet applied to advertised attributes — warn at load so it's visible
+    // rather than a silent no-op.
+    if direction == "export" {
+        if let crate::policy::Policy::RouteMap(map) = &resolved {
+            let unsupported = map.statements.iter().any(|s| {
+                !s.set.extra.community_add.is_empty()
+                    || !s.set.extra.community_remove.is_empty()
+                    || s.set.metric.is_some()
+            });
+            if unsupported {
+                tracing::warn!(
+                    peer = %peer,
+                    policy = %name,
+                    "export route-map has `set community`/`set metric` clauses that \
+                     bgpd does not yet apply on advertise; routes are advertised with \
+                     attributes unchanged"
+                );
+            }
+        }
     }
+    resolved
 }
 
 /// Build a `RedistributeFilter` for one peer by consulting its

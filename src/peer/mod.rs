@@ -138,6 +138,22 @@ enum StepOutcome {
     Stopped,
 }
 
+/// Map a codec [`ParseError`] to the NOTIFICATION (code, subcode) sent
+/// when resetting the session on a malformed inbound message. The
+/// typed errors already carry the RFC 4271 code/subcode; framing
+/// errors map to "Bad Message Length".
+fn parse_error_notification(e: &crate::error::ParseError) -> (crate::error::ErrorCode, u8) {
+    use crate::error::{ErrorCode, ParseError};
+    match e {
+        ParseError::Header { code, subcode, .. }
+        | ParseError::Open { code, subcode, .. }
+        | ParseError::Update { code, subcode, .. }
+        | ParseError::Notification { code, subcode, .. } => (*code, *subcode),
+        ParseError::Truncated { .. } => (ErrorCode::MessageHeader, 2),
+        ParseError::Capability(_) => (ErrorCode::OpenMessage, 0),
+    }
+}
+
 impl Peer {
     /// Create a Peer with an explicit FSM config and the channels
     /// it'll use to talk to its parent task. The Peer starts in
@@ -304,8 +320,10 @@ impl Peer {
     async fn handle_inbound(&mut self, bytes: Vec<u8>) {
         let header = match Header::parse(&bytes) {
             Ok(h) => h,
-            Err(_) => {
-                self.dispatch(PeerEvent::MessageParseError).await;
+            Err(e) => {
+                let (code, subcode) = parse_error_notification(&e);
+                self.dispatch(PeerEvent::MessageParseError { code, subcode })
+                    .await;
                 return;
             }
         };
@@ -313,11 +331,23 @@ impl Peer {
         match header.msg_type {
             MessageType::Open => match Open::parse_body(body) {
                 Ok(open) => self.dispatch(PeerEvent::OpenReceived(open)).await,
-                Err(_) => self.dispatch(PeerEvent::MessageParseError).await,
+                Err(e) => {
+                    let (code, subcode) = parse_error_notification(&e);
+                    self.dispatch(PeerEvent::MessageParseError { code, subcode })
+                        .await
+                }
             },
             MessageType::Update => match Update::parse_body(body) {
                 Ok(update) => self.dispatch(PeerEvent::UpdateReceived(update)).await,
-                Err(_) => self.dispatch(PeerEvent::MessageParseError).await,
+                // RFC 7606: a malformed UPDATE must not be silently
+                // dropped — the FSM sends the classified NOTIFICATION and
+                // resets (graceful per-NLRI treat-as-withdraw is a
+                // follow-up; see PeerEvent::MessageParseError).
+                Err(e) => {
+                    let (code, subcode) = parse_error_notification(&e);
+                    self.dispatch(PeerEvent::MessageParseError { code, subcode })
+                        .await
+                }
             },
             MessageType::Notification => match Notification::parse_body(body) {
                 Ok(n) => {
@@ -327,7 +357,11 @@ impl Peer {
                     })
                     .await
                 }
-                Err(_) => self.dispatch(PeerEvent::MessageParseError).await,
+                Err(e) => {
+                    let (code, subcode) = parse_error_notification(&e);
+                    self.dispatch(PeerEvent::MessageParseError { code, subcode })
+                        .await
+                }
             },
             MessageType::Keepalive => self.dispatch(PeerEvent::KeepaliveReceived).await,
             MessageType::RouteRefresh => {

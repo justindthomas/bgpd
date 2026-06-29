@@ -21,10 +21,15 @@
 //! (cheaper) and then asks this module to evaluate the BGP-only
 //! extras. A statement matches only if both halves agree.
 //!
-//! v1 ships **match-only** for BGP extras. Set-clause application
-//! (community_add / set local_pref / etc.) parses but is not yet
-//! applied to the advertised path attributes — that's a follow-up
-//! once we have a clean mutation point in the advertise pipeline.
+//! Set-clause application is partial. On the **import** side, `set
+//! local-preference` IS applied (Policy::import_v4 → StoredRoute::
+//! set_local_pref). Everything else — import `set community`/`metric`,
+//! and ALL **export** set clauses (community, metric/MED, as-path-
+//! prepend) — parses but is NOT yet applied to the path attributes.
+//! resolve_peer_policy warns at load when an export route-map carries
+//! such a clause, so it isn't a silent no-op; full export set
+//! application is a follow-up needing a mutation point in the advertise
+//! pipeline (build_outbound_attrs).
 
 use serde::Deserialize;
 use thiserror::Error;

@@ -127,11 +127,15 @@ pub enum PeerEvent {
     UpdateReceived(Update),
     /// Peer sent us a NOTIFICATION; tear down.
     NotificationReceived { code: ErrorCode, subcode: u8 },
-    /// Codec-side parse failure on an inbound message. The driver
-    /// has already classified the action; we just fold it into the
-    /// FSM as a fatal error for v1 (treat-as-withdraw is handled
-    /// at the UPDATE layer once the FSM hands the message off).
-    MessageParseError,
+    /// Codec-side parse failure on an inbound message, carrying the
+    /// NOTIFICATION code/subcode the codec classified. The FSM sends
+    /// that NOTIFICATION and resets the session (RFC 4271 §6.3) — a
+    /// malformed UPDATE must NOT be silently dropped (it would leave
+    /// our Adj-RIB-In diverged from the peer with no signal).
+    /// (RFC 7606 graceful treat-as-withdraw — withdraw only the
+    /// affected NLRI without a reset — needs the parser to surface the
+    /// NLRI past the offending attribute; until then we reset.)
+    MessageParseError { code: ErrorCode, subcode: u8 },
 }
 
 /// Side-effect requests emitted by the FSM. The driver loop
@@ -330,6 +334,9 @@ impl Fsm {
             // up. Drop it silently rather than treat it as an
             // FSM error and tear down the session.
             (PeerState::OpenSent, PeerEvent::Start) => Vec::new(),
+            (PeerState::OpenSent, PeerEvent::MessageParseError { code, subcode }) => {
+                self.notify_and_idle(code, subcode)
+            }
             (PeerState::OpenSent, _) => self.notify_and_idle(ErrorCode::FsmError, 0),
 
             // ---- OpenConfirm ----
@@ -366,6 +373,9 @@ impl Fsm {
             }
             // Same rationale as OpenSent: late retry is harmless.
             (PeerState::OpenConfirm, PeerEvent::Start) => Vec::new(),
+            (PeerState::OpenConfirm, PeerEvent::MessageParseError { code, subcode }) => {
+                self.notify_and_idle(code, subcode)
+            }
             (PeerState::OpenConfirm, _) => self.notify_and_idle(ErrorCode::FsmError, 0),
 
             // ---- Established ----
@@ -409,6 +419,9 @@ impl Fsm {
             | (PeerState::Established, PeerEvent::Stop) => self.go_idle(),
             (PeerState::Established, PeerEvent::NotificationReceived { .. }) => {
                 self.go_idle()
+            }
+            (PeerState::Established, PeerEvent::MessageParseError { code, subcode }) => {
+                self.notify_and_idle(code, subcode)
             }
             (PeerState::Established, _) => Vec::new(),
         }
@@ -692,6 +705,31 @@ mod tests {
         assert!(actions
             .iter()
             .any(|a| matches!(a, Action::ArmTimer { kind: TimerKind::Hold, .. })));
+    }
+
+    #[test]
+    fn established_malformed_update_notifies_and_idles() {
+        // RFC 7606 regression: a malformed UPDATE in Established must send
+        // the classified NOTIFICATION and reset the session — not be
+        // silently swallowed by the `(Established, _)` catch-all (which
+        // would leave our Adj-RIB-In diverged from the peer with no
+        // signal).
+        let mut fsm = Fsm::new(config());
+        fsm.handle_event(PeerEvent::Start);
+        fsm.handle_event(PeerEvent::TcpConnected);
+        fsm.handle_event(PeerEvent::OpenReceived(peer_open(65001, 90)));
+        fsm.handle_event(PeerEvent::KeepaliveReceived);
+        assert_eq!(fsm.state, PeerState::Established);
+        let actions = fsm.handle_event(PeerEvent::MessageParseError {
+            code: ErrorCode::UpdateMessage,
+            subcode: 1, // Malformed Attribute List
+        });
+        assert_eq!(fsm.state, PeerState::Idle);
+        let notif = actions.iter().find_map(|a| match a {
+            Action::SendNotification { code, subcode } => Some((*code, *subcode)),
+            _ => None,
+        });
+        assert_eq!(notif, Some((ErrorCode::UpdateMessage, 1)));
     }
 
     #[test]
