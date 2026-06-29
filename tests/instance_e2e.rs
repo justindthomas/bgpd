@@ -21,7 +21,7 @@ use tokio::sync::Mutex;
 
 use bgpd::config::{BgpDaemonConfig, BgpPeerConfig};
 use bgpd::control::SpeakerSnapshot;
-use bgpd::instance::BgpInstance;
+use bgpd::instance::{BgpInstance, InstanceControl};
 use bgpd::packet::attrs::{AsPathSegment, AsPathSegmentType, Origin, PathAttribute};
 use bgpd::packet::caps::{Capability, AFI_IPV4, SAFI_UNICAST};
 use bgpd::packet::header::{Header, MessageType, HEADER_LEN};
@@ -210,6 +210,48 @@ async fn run_fake_bgp_peer(listener: TcpListener) -> tokio::task::JoinHandle<()>
     })
 }
 
+/// Fake peer that handshakes to Established, signals `ready`, then
+/// reports `eof` the moment bgpd closes the connection (TCP FIN). Used
+/// by the graceful-shutdown regression test.
+async fn run_fake_bgp_peer_detect_close(
+    listener: TcpListener,
+    ready_tx: tokio::sync::oneshot::Sender<()>,
+    eof_tx: tokio::sync::oneshot::Sender<()>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        let (read_half, mut write_half) = sock.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        let _open = read_one_message(&mut reader).await; // bgpd OPEN
+        let our_open = Open::new(
+            REMOTE_ASN,
+            9,
+            Ipv4Addr::new(10, 0, 0, 2),
+            vec![Capability::Multiprotocol {
+                afi: AFI_IPV4,
+                safi: SAFI_UNICAST,
+            }],
+        );
+        write_half.write_all(&our_open.encode()).await.unwrap();
+        let _ka = read_one_message(&mut reader).await; // bgpd KEEPALIVE
+        write_half.write_all(&keepalive::encode()).await.unwrap(); // → Established
+        let _ = ready_tx.send(());
+
+        // Block until bgpd closes the session. A graceful shutdown sends
+        // a FIN, so the next read returns 0 (EOF). Any other read = a
+        // keepalive we ignore.
+        let mut buf = [0u8; 64];
+        loop {
+            match reader.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => continue,
+            }
+        }
+        let _ = eof_tx.send(());
+    })
+}
+
 async fn read_one_message(
     reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
 ) -> Vec<u8> {
@@ -312,4 +354,90 @@ async fn instance_e2e_pushes_received_route_to_ribd() {
         "bgpd should push the BGP route to ribd. Capture: {:?}",
         *capture.lock().await
     );
+}
+
+#[tokio::test]
+async fn instance_shutdown_closes_peer_sessions() {
+    // Graceful-shutdown regression (bgpd 87bf1dd): InstanceControl::
+    // Shutdown must fan PeerControl::Stop to every peer, closing the
+    // transport (TCP FIN) so the remote drops the session immediately.
+    // Without it a restart collides with the remote's stale session
+    // ("No AFI/SAFI activated") and flaps until the hold timer expires.
+    let (_ribd_dir, ribd_sock, _capture) = spawn_fake_ribd().await;
+    let bgp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bgp_addr = bgp_listener.local_addr().unwrap();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (eof_tx, eof_rx) = tokio::sync::oneshot::channel();
+    let fake_peer = run_fake_bgp_peer_detect_close(bgp_listener, ready_tx, eof_tx).await;
+
+    let config = BgpDaemonConfig {
+        enabled: true,
+        local_asn: LOCAL_ASN,
+        router_id: Some(Ipv4Addr::new(10, 0, 0, 1)),
+        peers: vec![BgpPeerConfig {
+            address: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            port: Some(bgp_addr.port()),
+            remote_asn: REMOTE_ASN,
+            local_asn: None,
+            router_id: None,
+            source_address: None,
+            password: None,
+            hold_time: Some(9),
+            address_families: Vec::new(),
+            import_policy: None,
+            export_policy: None,
+            redistribute: Vec::new(),
+        }],
+        announced_prefixes_v4: Vec::new(),
+        announced_prefixes_v6: Vec::new(),
+        aggregates_v4: Vec::new(),
+        aggregates_v6: Vec::new(),
+        listen_address: None,
+        route_maps: std::collections::HashMap::new(),
+        table_id_v4: 0,
+        table_id_v6: 0,
+        vrf_name: None,
+    };
+
+    let snapshot = Arc::new(Mutex::new(SpeakerSnapshot::default()));
+    let (mut instance, instance_control_tx) = BgpInstance::new(
+        config,
+        std::path::PathBuf::from("/dev/null"),
+        ribd_sock.to_str().unwrap(),
+        snapshot.clone(),
+    )
+    .await
+    .expect("instance");
+    instance.spawn_peers().await.expect("spawn peers");
+    let runner = tokio::spawn(async move {
+        instance.run().await;
+    });
+
+    // Wait for the handshake to reach Established.
+    tokio::time::timeout(Duration::from_secs(3), ready_rx)
+        .await
+        .expect("handshake timed out")
+        .expect("peer ready");
+
+    // Trigger graceful shutdown.
+    instance_control_tx
+        .send(InstanceControl::Shutdown)
+        .await
+        .expect("send Shutdown");
+
+    // The peer must observe the FIN (session closed) within the grace
+    // window...
+    let closed = tokio::time::timeout(Duration::from_secs(2), eof_rx).await;
+    assert!(
+        matches!(closed, Ok(Ok(()))),
+        "peer session was not closed on InstanceControl::Shutdown"
+    );
+
+    // ...and the instance run loop must return (Shutdown breaks it).
+    tokio::time::timeout(Duration::from_secs(2), runner)
+        .await
+        .expect("instance.run() did not return after Shutdown")
+        .expect("runner join");
+
+    let _ = fake_peer.await;
 }
