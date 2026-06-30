@@ -259,7 +259,29 @@ fn set_tcp_md5sig(socket: &TcpSocket, peer: IpAddr, password: &str) -> io::Resul
 #[cfg(feature = "vcl")]
 pub mod vcl_transport {
     use super::*;
+    use std::collections::HashMap;
+    use std::net::{IpAddr, Ipv6Addr};
     use tokio::sync::{mpsc, oneshot};
+
+    use crate::adj_rib::PeerId;
+    use crate::peer::PeerControl;
+
+    /// Serialize the ENTIRE VCL session setup (worker registration +
+    /// session create / bind / connect / listen / attr) across every
+    /// VCL thread in the process — the per-peer active I/O threads AND
+    /// the single passive-listener thread.
+    ///
+    /// libvppcom 25.10's worker-pool growth is not thread-safe:
+    /// registering a worker reallocs `vcm->workers` and frees the old
+    /// buffer, while concurrent threads inside `vppcom_session_create`
+    /// (and the other session-setup calls) load `vcm->workers` and
+    /// dereference it — racing the realloc faults on a freed pointer.
+    /// `register_worker_thread`'s own lock only serializes
+    /// register-vs-register; holding THIS lock across the whole setup
+    /// makes registration and session creation strictly sequential
+    /// across all VCL threads. It's dropped before any steady-state I/O
+    /// loop, so live traffic isn't serialized.
+    static VCL_SETUP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     enum IoCmd {
         Send(Vec<u8>, oneshot::Sender<Result<(), String>>),
@@ -323,6 +345,26 @@ pub mod vcl_transport {
                 cached_local_addr,
             })
         }
+
+        /// Build a transport from channels wired to an externally-owned
+        /// VCL session — used by the passive listener, which accepts a
+        /// session on its own worker thread and services it there (VCL
+        /// sessions are thread-local; an accepted session can't be moved
+        /// to a per-peer thread). The listener feeds inbound messages
+        /// into `msg_rx` and drains writes from the matching `cmd_tx`,
+        /// so the peer FSM driver sees the same `BgpTransport` surface
+        /// as the active path.
+        fn from_channels(
+            cmd_tx: mpsc::Sender<IoCmd>,
+            msg_rx: mpsc::Receiver<Result<Vec<u8>, String>>,
+            local_addr: Option<SocketAddr>,
+        ) -> Self {
+            VclTransport {
+                cmd_tx: Some(cmd_tx),
+                msg_rx,
+                cached_local_addr: local_addr,
+            }
+        }
     }
 
     /// The I/O thread: registers as a VCL worker, creates and
@@ -336,24 +378,10 @@ pub mod vcl_transport {
         ready_tx: oneshot::Sender<Result<Option<SocketAddr>, String>>,
     ) {
         // Serialize the ENTIRE VCL session setup (worker registration +
-        // session create / bind / connect / attr) across all per-peer I/O
-        // threads.
-        //
-        // libvppcom 25.10's worker-pool growth is not thread-safe: registering
-        // a worker reallocs `vcm->workers` and frees the old buffer, while
-        // concurrent threads inside `vppcom_session_create` (and the other
-        // session-setup calls) load `vcm->workers` and dereference it —
-        // racing the realloc faults on a freed pointer. With multiple peers
-        // (a v4 + v6 session) the per-peer threads start together and overlap
-        // their setup, segfaulting bgpd on startup.
-        //
-        // `register_worker_thread`'s own lock only serializes register-vs-
-        // register; it does NOT stop register-vs-session-create. Holding this
-        // process-wide lock across the whole setup makes registration and
-        // session creation strictly sequential. It's dropped before the
-        // steady-state I/O loop, so live traffic isn't serialized — by then
-        // the worker pool is quiescent for this thread.
-        static VCL_SETUP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        // session create / bind / connect / attr) across all VCL threads —
+        // see `VCL_SETUP_LOCK` for the libvppcom 25.10 worker-pool-realloc
+        // race this guards against. Dropped before the steady-state I/O loop
+        // so live traffic isn't serialized.
         let setup_guard = VCL_SETUP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         // Register this dedicated per-peer I/O thread as a VCL worker via
@@ -592,12 +620,332 @@ pub mod vcl_transport {
                     buf.len() - pos,
                 )
             };
+            // A BGP body can span multiple TCP segments; on a
+            // non-blocking session the next chunk may not be ready yet.
+            // Spin (the header already committed us to reading the rest)
+            // rather than mistaking EAGAIN for a closed connection.
+            if rc == -libc::EAGAIN || rc == -libc::EWOULDBLOCK {
+                std::thread::sleep(Duration::from_micros(100));
+                continue;
+            }
             if rc <= 0 {
                 return Err(format!("read failed: {}", rc));
             }
             pos += rc as usize;
         }
         Ok(())
+    }
+
+    /// Try to read exactly one BGP message from a non-blocking VCL
+    /// session. `Ok(None)` means no message is pending yet (EAGAIN with
+    /// nothing buffered); `Ok(Some(bytes))` is a full message
+    /// (header + body); `Err` is a real read/framing error. Used by the
+    /// passive listener to multiplex many accepted sessions on one
+    /// worker thread without blocking on any single idle peer.
+    fn try_read_message_vcl(sh: u32) -> Result<Option<Vec<u8>>, String> {
+        let mut header = [0u8; HEADER_LEN];
+        match read_exact_vcl_nb(sh, &mut header)? {
+            false => return Ok(None),
+            true => {}
+        }
+        let total_len = u16::from_be_bytes([header[16], header[17]]) as usize;
+        if total_len < HEADER_LEN || total_len > MAX_MESSAGE_LEN {
+            return Err(format!("bad length {}", total_len));
+        }
+        let mut buf = vec![0u8; total_len];
+        buf[..HEADER_LEN].copy_from_slice(&header);
+        if total_len > HEADER_LEN {
+            read_exact_vcl(sh, &mut buf[HEADER_LEN..])?;
+        }
+        Ok(Some(buf))
+    }
+
+    /// Write `data` in full to a VCL session, spinning over EAGAIN /
+    /// short writes. Shared by the active I/O thread and the passive
+    /// listener.
+    fn write_all_vcl(sh: u32, data: &[u8]) -> Result<(), String> {
+        let mut pos = 0;
+        while pos < data.len() {
+            let rc = unsafe {
+                vcl_rs::ffi::vppcom_session_write(
+                    sh,
+                    data[pos..].as_ptr() as *mut _,
+                    data.len() - pos,
+                )
+            };
+            if rc < 0 && rc != -libc::EAGAIN {
+                return Err(format!("write failed: {}", rc));
+            }
+            if rc > 0 {
+                pos += rc as usize;
+            }
+            if rc == -libc::EAGAIN || rc == 0 {
+                std::thread::sleep(Duration::from_micros(100));
+            }
+        }
+        Ok(())
+    }
+
+    /// Set TCP_NODELAY on a VCL session (Nagle off so KEEPALIVEs aren't
+    /// delayed).
+    fn set_session_nodelay(sh: u32) {
+        let val: u32 = 1;
+        let mut len = 4u32;
+        unsafe {
+            vcl_rs::ffi::vppcom_session_attr(
+                sh,
+                vcl_rs::ffi::VPPCOM_ATTR_SET_TCP_NODELAY,
+                &val as *const _ as *mut _,
+                &mut len,
+            );
+        }
+    }
+
+    /// Switch a VCL session to non-blocking mode (so reads return
+    /// EAGAIN instead of parking the worker thread).
+    fn set_session_nonblocking(sh: u32) {
+        let flags: u32 = libc::O_NONBLOCK as u32;
+        let mut flen = std::mem::size_of::<u32>() as u32;
+        unsafe {
+            vcl_rs::ffi::vppcom_session_attr(
+                sh,
+                vcl_rs::ffi::VPPCOM_ATTR_SET_FLAGS,
+                &flags as *const _ as *mut _,
+                &mut flen,
+            );
+        }
+    }
+
+    /// Query the local 5-tuple address of a connected/accepted VCL
+    /// session (used as the BGP next-hop for "next-hop self").
+    fn query_local_addr_vcl(sh: u32) -> Option<SocketAddr> {
+        let mut ip_buf = [0u8; 16];
+        let mut ep = vcl_rs::ffi::vppcom_endpt_t {
+            ip: ip_buf.as_mut_ptr(),
+            ..Default::default()
+        };
+        let mut len = std::mem::size_of::<vcl_rs::ffi::vppcom_endpt_t>() as u32;
+        let rc = unsafe {
+            vcl_rs::ffi::vppcom_session_attr(
+                sh,
+                vcl_rs::ffi::VPPCOM_ATTR_GET_LCL_ADDR,
+                &mut ep as *mut _ as *mut _,
+                &mut len,
+            )
+        };
+        if rc < 0 {
+            return None;
+        }
+        Some(socketaddr_from_endpt(&ep, &ip_buf))
+    }
+
+    /// Reconstruct a `SocketAddr` from a VCL endpoint + its IP buffer.
+    fn socketaddr_from_endpt(ep: &vcl_rs::ffi::vppcom_endpt_t, ip_buf: &[u8; 16]) -> SocketAddr {
+        let port = u16::from_be(ep.port);
+        if ep.is_ip4 != 0 {
+            let mut o = [0u8; 4];
+            o.copy_from_slice(&ip_buf[..4]);
+            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::from(o)), port)
+        } else {
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::from(*ip_buf)), port)
+        }
+    }
+
+    /// One accepted, listener-owned VCL session and the channels that
+    /// bridge it to the peer FSM driver's `VclTransport`.
+    struct AcceptedSession {
+        sh: u32,
+        peer_id: PeerId,
+        /// Writes from the peer driver to push onto the wire.
+        cmd_rx: mpsc::Receiver<IoCmd>,
+        /// Inbound messages read off the wire, delivered to the driver.
+        msg_tx: mpsc::Sender<Result<Vec<u8>, String>>,
+    }
+
+    /// Spawn the passive BGP listener over VPP's VCL stack. A single
+    /// dedicated worker thread binds/listens and ALSO services every
+    /// accepted session — VCL sessions are thread-local (an accepted
+    /// session lives in the accepting worker's pool and libvppcom
+    /// exposes no session→worker migration), so the listen socket and
+    /// its children must share one worker. Inbound connections from a
+    /// known peer IP are wrapped in a channel-backed `VclTransport` and
+    /// injected into that peer's FSM via `PeerControl::InjectTransport`;
+    /// unknown sources are closed.
+    pub fn spawn_vcl_listener(
+        listen_addr: SocketAddr,
+        peer_map: HashMap<IpAddr, (PeerId, mpsc::Sender<PeerControl>)>,
+    ) -> io::Result<()> {
+        std::thread::Builder::new()
+            .name("vcl-bgp-listener".into())
+            .spawn(move || vcl_listener_thread(listen_addr, peer_map))?;
+        Ok(())
+    }
+
+    fn vcl_listener_thread(
+        listen_addr: SocketAddr,
+        peer_map: HashMap<IpAddr, (PeerId, mpsc::Sender<PeerControl>)>,
+    ) {
+        // Serialize listen-session setup against the active threads'
+        // session setup — same libvppcom worker-pool-realloc race.
+        let setup_guard = VCL_SETUP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        vcl_rs::register_worker_thread();
+
+        // Non-blocking listen session so accept() returns EAGAIN
+        // instead of parking the worker (which also services accepted
+        // sessions).
+        let listen_sh =
+            unsafe { vcl_rs::ffi::vppcom_session_create(vcl_rs::ffi::VPPCOM_PROTO_TCP, 1) };
+        if listen_sh < 0 {
+            tracing::error!("VCL listener session_create failed: {}", listen_sh);
+            return;
+        }
+        let listen_sh = listen_sh as u32;
+
+        let mut ip_buf = [0u8; 16];
+        let mut ep = vcl_rs::session::endpoint_into_buf(listen_addr, &mut ip_buf);
+        let rc = unsafe { vcl_rs::ffi::vppcom_session_bind(listen_sh, &mut ep) };
+        if rc < 0 {
+            tracing::error!(%listen_addr, "VCL listener bind failed: {}", rc);
+            unsafe { vcl_rs::ffi::vppcom_session_close(listen_sh) };
+            return;
+        }
+        let rc = unsafe { vcl_rs::ffi::vppcom_session_listen(listen_sh, 16) };
+        if rc < 0 {
+            tracing::error!(%listen_addr, "VCL listener listen failed: {}", rc);
+            unsafe { vcl_rs::ffi::vppcom_session_close(listen_sh) };
+            return;
+        }
+        drop(setup_guard);
+        tracing::info!(%listen_addr, "VCL BGP listener bound (passive open)");
+
+        let mut sessions: Vec<AcceptedSession> = Vec::new();
+
+        loop {
+            // 1. Drain any pending inbound connections (non-blocking).
+            loop {
+                let mut aip = [0u8; 16];
+                let mut aep = vcl_rs::ffi::vppcom_endpt_t {
+                    ip: aip.as_mut_ptr(),
+                    ..Default::default()
+                };
+                let rc = unsafe { vcl_rs::ffi::vppcom_session_accept(listen_sh, &mut aep, 0) };
+                if rc == -libc::EAGAIN || rc == -libc::EWOULDBLOCK {
+                    break;
+                }
+                if rc < 0 {
+                    tracing::warn!("VCL listener accept error: {}", rc);
+                    break;
+                }
+                let new_sh = rc as u32;
+                let peer_ip = if aep.is_ip4 != 0 {
+                    let mut o = [0u8; 4];
+                    o.copy_from_slice(&aip[..4]);
+                    IpAddr::V4(std::net::Ipv4Addr::from(o))
+                } else {
+                    IpAddr::V6(Ipv6Addr::from(aip))
+                };
+
+                set_session_nonblocking(new_sh);
+                set_session_nodelay(new_sh);
+
+                match peer_map.get(&peer_ip) {
+                    Some((peer_id, control_tx)) => {
+                        let local_addr = query_local_addr_vcl(new_sh);
+                        let (cmd_tx, cmd_rx) = mpsc::channel::<IoCmd>(64);
+                        let (msg_tx, msg_rx) =
+                            mpsc::channel::<Result<Vec<u8>, String>>(64);
+                        let transport =
+                            VclTransport::from_channels(cmd_tx, msg_rx, local_addr);
+                        if control_tx
+                            .blocking_send(PeerControl::InjectTransport(Box::new(transport)))
+                            .is_ok()
+                        {
+                            tracing::info!(
+                                %peer_ip,
+                                peer_id,
+                                "accepted inbound BGP connection (VCL)"
+                            );
+                            sessions.push(AcceptedSession {
+                                sh: new_sh,
+                                peer_id: *peer_id,
+                                cmd_rx,
+                                msg_tx,
+                            });
+                        } else {
+                            // Peer task gone — drop the session.
+                            unsafe { vcl_rs::ffi::vppcom_session_close(new_sh) };
+                        }
+                    }
+                    None => {
+                        tracing::warn!(
+                            %peer_ip,
+                            "rejected inbound VCL BGP connection from unknown peer"
+                        );
+                        unsafe { vcl_rs::ffi::vppcom_session_close(new_sh) };
+                    }
+                }
+            }
+
+            // 2. Service every accepted session: deliver inbound
+            //    messages and drain outbound writes, all non-blocking.
+            let mut i = 0;
+            while i < sessions.len() {
+                let mut drop_session = false;
+
+                match try_read_message_vcl(sessions[i].sh) {
+                    Ok(Some(buf)) => {
+                        if sessions[i].msg_tx.blocking_send(Ok(buf)).is_err() {
+                            // Driver dropped its receiver — session done.
+                            drop_session = true;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        let _ = sessions[i].msg_tx.blocking_send(Err(e));
+                        drop_session = true;
+                    }
+                }
+
+                if !drop_session {
+                    loop {
+                        match sessions[i].cmd_rx.try_recv() {
+                            Ok(IoCmd::Send(data, reply)) => {
+                                let r = write_all_vcl(sessions[i].sh, &data);
+                                let failed = r.is_err();
+                                let _ = reply.send(r);
+                                if failed {
+                                    drop_session = true;
+                                    break;
+                                }
+                            }
+                            Ok(IoCmd::Close) => {
+                                drop_session = true;
+                                break;
+                            }
+                            Err(mpsc::error::TryRecvError::Empty) => break,
+                            Err(mpsc::error::TryRecvError::Disconnected) => {
+                                drop_session = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if drop_session {
+                    tracing::debug!(
+                        peer_id = sessions[i].peer_id,
+                        "closing accepted VCL BGP session"
+                    );
+                    unsafe { vcl_rs::ffi::vppcom_session_close(sessions[i].sh) };
+                    sessions.swap_remove(i);
+                } else {
+                    i += 1;
+                }
+            }
+
+            // Avoid a busy spin when idle.
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     fn map_io_err(e: String) -> TransportError {

@@ -167,6 +167,16 @@ pub struct BgpPeerConfig {
     /// a rule for that protocol is present, and only if the
     /// referenced route-map (if any) permits them.
     pub redistribute: Vec<RedistributeRule>,
+    /// Passive peer: never initiate the outbound TCP connect. The
+    /// session can only come up when the remote connects to our
+    /// listener (`bgp.listen_address` must be set). Mirrors
+    /// Cisco/Juniper `neighbor … passive` / a route-server pattern.
+    /// Without this the daemon both connects AND accepts, which —
+    /// absent RFC 4271 §6.8 collision detection (v2) — races two
+    /// half-open sessions. `passive: true` makes the listener path
+    /// the sole way the session establishes, which is exactly what
+    /// exercises (and tests) the VCL passive-open path.
+    pub passive: bool,
 }
 
 impl BgpPeerConfig {
@@ -390,6 +400,11 @@ pub struct BgpPeerYaml {
     /// redistribute list.
     #[serde(default)]
     pub redistribute: Vec<BgpRedistributeYaml>,
+    /// When true, never initiate the outbound connect — only accept
+    /// inbound from this peer via `bgp.listen_address`. Default false
+    /// (active + passive, legacy behaviour).
+    #[serde(default)]
+    pub passive: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -593,6 +608,7 @@ impl BgpDaemonConfig {
                 import_policy: p.import_policy,
                 export_policy: p.export_policy,
                 redistribute,
+                passive: p.passive,
             });
         }
         // Parse announced_prefixes — a mixed list of CIDR
@@ -706,6 +722,7 @@ mod tests {
                 import_policy: None,
                 export_policy: None,
                 redistribute: Vec::new(),
+                passive: false,
             }],
             ..Default::default()
         };
@@ -731,6 +748,41 @@ mod tests {
         };
         let err = BgpDaemonConfig::from_yaml(yaml).unwrap_err();
         assert!(matches!(err, ConfigError::MissingField("asn")));
+    }
+
+    #[test]
+    fn peer_passive_flag_parses_and_defaults_false() {
+        // Default: active peer (legacy behaviour).
+        let yaml = BgpYamlConfig {
+            enabled: true,
+            asn: Some(65000),
+            router_id: Some("10.0.0.1".into()),
+            peers: vec![BgpPeerYaml {
+                peer_ip: "192.0.2.1".into(),
+                peer_asn: 65001,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let cfg = BgpDaemonConfig::from_yaml(yaml).unwrap();
+        assert!(!cfg.peers[0].passive, "peer should default to active");
+
+        // Explicit passive: true round-trips into BgpPeerConfig.
+        let yaml = BgpYamlConfig {
+            enabled: true,
+            asn: Some(65000),
+            router_id: Some("10.0.0.1".into()),
+            listen_address: Some("10.0.0.1:179".into()),
+            peers: vec![BgpPeerYaml {
+                peer_ip: "192.0.2.1".into(),
+                peer_asn: 65001,
+                passive: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let cfg = BgpDaemonConfig::from_yaml(yaml).unwrap();
+        assert!(cfg.peers[0].passive, "passive: true must carry through");
     }
 
     #[test]

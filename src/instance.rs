@@ -445,11 +445,23 @@ impl BgpInstance {
             }
         });
 
-        // Spawn the driver loop and tell it to start.
+        // Spawn the driver loop. For an active peer, tell it to
+        // start (Idle → Connect → outbound TCP connect). A passive
+        // peer is left in Idle: it only comes up when the listener
+        // injects an accepted inbound transport, so we must NOT send
+        // Start (that would initiate the outbound connect we're
+        // explicitly suppressing).
         tokio::spawn(async move {
             peer.run().await;
         });
-        let _ = control_tx.send(PeerControl::Start).await;
+        if !cfg.passive {
+            let _ = control_tx.send(PeerControl::Start).await;
+        } else {
+            tracing::info!(
+                peer = %cfg.address,
+                "passive peer — awaiting inbound connection on the listener"
+            );
+        }
 
         // Build per-peer policy from config, falling back to
         // RFC 8212 defaults (deny-all for eBGP, accept-all for
@@ -523,6 +535,23 @@ impl BgpInstance {
             if let Some(cfg) = self.config.peers.get((pid - 1) as usize) {
                 peer_map.insert(cfg.address, (pid, tx.clone()));
             }
+        }
+
+        // Under VCL, peers connect to us over VPP's session layer, not
+        // the kernel — a kernel `TcpListener` on the VPP-side address
+        // would never see them. Hand off to the dedicated VCL listener
+        // worker thread (which accepts AND services accepted sessions;
+        // VCL sessions are thread-local). The thread runs detached for
+        // the daemon's lifetime, mirroring the active per-peer I/O
+        // threads, so there's no tokio JoinHandle to return.
+        #[cfg(feature = "vcl")]
+        if self.vcl_enabled {
+            if let Err(e) =
+                crate::peer::transport::vcl_transport::spawn_vcl_listener(addr, peer_map)
+            {
+                tracing::error!(%addr, "failed to spawn VCL BGP listener: {}", e);
+            }
+            return None;
         }
 
         let handle = tokio::spawn(async move {
@@ -924,7 +953,22 @@ impl BgpInstance {
                     // backoff sleeps; the FSM will treat the
                     // Start as a no-op if the peer has already
                     // come back up by the time it lands.
-                    if let Some(tx) = self.peer_controls.get(&peer_id).cloned() {
+                    //
+                    // Passive peers never initiate — re-Starting one
+                    // would defeat the point. They re-establish only
+                    // when the remote reconnects to the listener.
+                    let is_passive = self
+                        .config
+                        .peers
+                        .get((peer_id - 1) as usize)
+                        .map(|c| c.passive)
+                        .unwrap_or(false);
+                    if is_passive {
+                        tracing::info!(
+                            peer_id,
+                            "passive peer went Idle — awaiting inbound reconnect"
+                        );
+                    } else if let Some(tx) = self.peer_controls.get(&peer_id).cloned() {
                         tokio::spawn(async move {
                             tokio::time::sleep(IDLE_RETRY_BACKOFF).await;
                             let _ = tx.send(PeerControl::Start).await;
