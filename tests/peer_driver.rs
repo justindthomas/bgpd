@@ -188,6 +188,98 @@ async fn driver_reaches_established_and_delivers_update() {
     assert!(saw_update, "peer should deliver the UPDATE");
 }
 
+/// Regression for the intermittent BGP route flake: when bgpd's
+/// first outbound connect fails (peer/VPP not ready at bring-up),
+/// the FSM parks in `Active` and the *only* way out is the
+/// ConnectRetryTimer. The instance's Idle-retry path doesn't cover
+/// `Active` (a `Start` there is a no-op), so the ConnectRetry
+/// interval alone governs how fast the session recovers. With the
+/// old hardcoded 120s the peer sat past the 120s `TIMEOUT_BGP` test
+/// budget and the route never arrived.
+///
+/// This drives the real connect path against a closed port (forcing
+/// `TcpFails`), waits until the peer is deterministically parked in
+/// `Active`, then opens a listener and asserts the driver re-connects
+/// within a few ConnectRetry intervals — i.e. a failed first connect
+/// does NOT strand the peer for the full RFC 120s. Against the pre-fix
+/// behaviour the accept never arrives and this times out.
+///
+/// Multi-thread runtime so the driver's retry loop and the test's
+/// accept don't contend on a single thread (the real daemon runs
+/// multi-thread too).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn driver_retries_connect_promptly_after_failure() {
+    // Grab a free port, then drop the listener so the first connect
+    // is refused (ECONNREFUSED → TcpFails → Active).
+    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = probe.local_addr().unwrap();
+    drop(probe);
+
+    let (control_tx, control_rx) = mpsc::channel(8);
+    let (state_tx, mut state_rx) = mpsc::channel(64);
+
+    // Short ConnectRetry mirrors the shipped instance default
+    // (`CONNECT_RETRY`, 5s) on a faster clock so the test is quick.
+    let cfg = PeerFsmConfig {
+        connect_retry: Duration::from_millis(200),
+        ..local_config()
+    };
+    let mut peer = Peer::new(cfg, control_rx, state_tx);
+    peer.set_connect_info(bgpd::peer::PeerConnectInfo {
+        peer: addr,
+        source: None,
+        password: None,
+        timeout: Duration::from_millis(500),
+    });
+
+    // Spawn the driver loop, then kick it: Start → Connect →
+    // InitiateTcpConnect (real connect, refused) → Active with the
+    // ConnectRetry timer armed. From there the only recovery is the
+    // ConnectRetryTimer re-firing the connect.
+    let driver = tokio::spawn(async move { peer.run().await });
+    control_tx.send(PeerControl::Start).await.unwrap();
+
+    // Deterministically wait until the first connect has FAILED and
+    // the peer is parked in `Active`. Opening the listener only after
+    // this guarantees we actually exercise the ConnectRetry path
+    // (otherwise the listener could race ahead of the first connect,
+    // which would then succeed regardless of the retry interval).
+    let parked = tokio::time::timeout(Duration::from_secs(4), async {
+        while let Some(ev) = state_rx.recv().await {
+            if matches!(ev, PeerStateUpdate::StateChanged(PeerState::Active, _)) {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    assert!(
+        matches!(parked, Ok(true)),
+        "peer did not reach Active after a refused first connect"
+    );
+
+    // Now open a listener on the same port and wait for the driver to
+    // reconnect. If it lands within a handful of ConnectRetry ticks,
+    // the failed first connect did not strand the peer. Against the
+    // pre-fix 120s ConnectRetry this accept never arrives in time.
+    let listener = loop {
+        match TcpListener::bind(addr).await {
+            Ok(l) => break l,
+            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    };
+
+    let accepted = tokio::time::timeout(Duration::from_secs(10), listener.accept()).await;
+    assert!(
+        accepted.is_ok(),
+        "driver did not re-connect after a failed first connect — \
+         peer was stranded in Active (the 120s ConnectRetry flake)"
+    );
+
+    drop(control_tx);
+    driver.abort();
+}
+
 // Sanity test for the FSM in isolation (without driver/transport
 // wiring) — proves the public API surface from `bgpd::peer`
 // is usable by external consumers (which is what the instance

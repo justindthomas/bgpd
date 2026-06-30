@@ -55,6 +55,23 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// exponential per peer with a cap. The FSM treats `Start` from
 /// any non-Idle state as a no-op, so racing retries are harmless.
 const IDLE_RETRY_BACKOFF: Duration = Duration::from_secs(30);
+/// ConnectRetryTimer (RFC 4271 §8). This is the *only* path out of
+/// the `Active` state: when an outbound connect fails (peer/VPP not
+/// ready yet at bring-up — interface address not programmed, ARP not
+/// resolved, remote BGP not listening), the FSM parks in `Active` and
+/// re-attempts the connect when this timer fires. The instance's
+/// Idle-retry path (`IDLE_RETRY_BACKOFF`) does NOT cover `Active`
+/// (a `Start` is a no-op there), so this timer alone governs
+/// reconnect latency after a failed first connect.
+///
+/// RFC's default is 120s, but that's the wrong value here: it equals
+/// the integration suite's `TIMEOUT_BGP` (120s), so a single missed
+/// first-connect parks the peer past the test deadline — the
+/// intermittent "10.99.0.0/24 never arrives" BGP flake. More broadly,
+/// 120s is far too slow for a single-appliance router to converge.
+/// Use a short retry (BIRD defaults its `connect retry time` to 5s for
+/// the same reason); a genuinely-down peer just costs one SYN every 5s.
+const CONNECT_RETRY: Duration = Duration::from_secs(5);
 
 /// Out-of-band commands the parent (main.rs / signal handlers)
 /// can send to the running instance task. `Reload` is used by
@@ -381,7 +398,7 @@ impl BgpInstance {
             local_router_id: effective_router_id,
             remote_asn: cfg.remote_asn,
             local_hold_time: cfg.hold_time.unwrap_or(90),
-            connect_retry: Duration::from_secs(120),
+            connect_retry: CONNECT_RETRY,
         };
         let connect_info = PeerConnectInfo {
             peer: SocketAddr::new(cfg.address, cfg.port.unwrap_or(DEFAULT_BGP_PORT)),
@@ -2108,6 +2125,23 @@ mod tests {
     };
     use crate::packet::update::{Prefix4, Update};
     use std::net::Ipv4Addr;
+
+    // Regression guard for the intermittent BGP route flake
+    // (10.99.0.0/24 never arrives within TIMEOUT_BGP). `Active` is
+    // only left when the ConnectRetryTimer fires, and the instance's
+    // Idle-retry path doesn't cover it, so a failed first connect
+    // parks the peer for `CONNECT_RETRY`. If that ever creeps back up
+    // to (or past) the 120s test budget, a single missed connect at
+    // bring-up blows the deadline. Keep it well under that.
+    #[test]
+    fn connect_retry_is_fast_enough_to_converge_in_test_budget() {
+        assert!(
+            CONNECT_RETRY <= Duration::from_secs(15),
+            "CONNECT_RETRY ({:?}) must stay well under the 120s TIMEOUT_BGP \
+             so a failed first connect retries inside the test window",
+            CONNECT_RETRY
+        );
+    }
 
     fn snapshot_with_peer() -> SpeakerSnapshot {
         let mut snap = SpeakerSnapshot::default();
