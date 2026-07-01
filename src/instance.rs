@@ -842,17 +842,26 @@ impl BgpInstance {
             } else {
                 crate::policy::PeerPolicy::ibgp_default()
             };
-            let import = resolve_peer_policy(
+            // Resolve against the freshly-read config, but on the reload
+            // path a NAMED policy that no longer resolves retains the peer's
+            // last-good policy instead of collapsing to the RFC 8212 default
+            // (see resolve_peer_policy_retain — this is what stops an
+            // un-normalized SIGHUP re-read from blackholing established
+            // routes).
+            let prior = self.peer_policies.get(&pid);
+            let import = resolve_peer_policy_retain(
                 new_p.import_policy.as_deref(),
                 &new_config.route_maps,
                 &default_policy.import,
+                prior.map(|p| &p.import),
                 new_p.address,
                 "import",
             );
-            let export = resolve_peer_policy(
+            let export = resolve_peer_policy_retain(
                 new_p.export_policy.as_deref(),
                 &new_config.route_maps,
                 &default_policy.export,
+                prior.map(|p| &p.export),
                 new_p.address,
                 "export",
             );
@@ -1955,6 +1964,69 @@ fn source_for_origin(oc: OriginClass) -> ribd_proto::Source {
 /// shortcut to the keyword variants; any other name is looked up
 /// in `route_maps`. Unknown name falls back to `default` with a
 /// warning so an operator typo doesn't silently change behavior.
+/// Reload-path policy resolution. Same as [`resolve_peer_policy`], but
+/// when `name` is present and fails to resolve to a known keyword or
+/// route-map, prefer the peer's previously-resolved policy (`prior`)
+/// over the RFC 8212 `default`.
+///
+/// Why this matters: bgpd reads route-maps from the *top-level*
+/// `route_maps:` block of router.yaml (the "shared across daemons"
+/// format). ecrd's `save_config` is what mirrors the operator's
+/// `bgp.route_maps` there and inlines named prefix-lists; a router.yaml
+/// that hasn't been through that step (a hand-edit, a boot-env rollback,
+/// or — the case that made the integration suite flake — a raw
+/// `pkill -HUP -x bgpd` that races ecrd's save) carries the route-maps
+/// only under `bgp:`, where bgpd never looks. On such a read
+/// `import_policy: UPSTREAM-IN` resolves to *nothing*, and the old code
+/// fell back to `ebgp_default_deny()`. That silently replaced a working
+/// import policy with deny-all: every route the peer had already sent
+/// stays in the pre-policy Adj-RIB-In but drops out of Loc-RIB, and the
+/// loss persists until some later reload happens to read a normalized
+/// file. Retaining the last-resolved policy makes the reload
+/// order-insensitive so established routes survive the race.
+///
+/// Scope is deliberately narrow: only the "name given but currently
+/// unknown" case retains. An absent name still takes the default, and a
+/// name that *does* resolve (including to `deny-all`) still updates
+/// normally — so an operator intentionally tightening or dropping a
+/// policy is unaffected.
+fn resolve_peer_policy_retain(
+    name: Option<&str>,
+    route_maps: &std::collections::HashMap<String, crate::config::BgpRouteMap>,
+    default: &crate::policy::Policy,
+    prior: Option<&crate::policy::Policy>,
+    peer: std::net::IpAddr,
+    direction: &'static str,
+) -> crate::policy::Policy {
+    if let Some(n) = name {
+        if crate::policy::resolve_policy_name(n, route_maps).is_none() {
+            return match prior {
+                Some(prev) => {
+                    tracing::warn!(
+                        peer = %peer,
+                        direction,
+                        policy = %n,
+                        "route-map not found on reload; retaining last-resolved \
+                         policy (router.yaml likely read before ecrd mirrored \
+                         route_maps to the top-level block)"
+                    );
+                    prev.clone()
+                }
+                None => {
+                    tracing::warn!(
+                        peer = %peer,
+                        direction,
+                        policy = %n,
+                        "route-map not found and no prior policy; using default"
+                    );
+                    default.clone()
+                }
+            };
+        }
+    }
+    resolve_peer_policy(name, route_maps, default, peer, direction)
+}
+
 fn resolve_peer_policy(
     name: Option<&str>,
     route_maps: &std::collections::HashMap<String, crate::config::BgpRouteMap>,
@@ -2762,6 +2834,92 @@ statements:
             loc.v4_unicast.contains_key(&pfx),
             "permitting import must surface the pre-policy route in Loc-RIB"
         );
+    }
+
+    #[test]
+    fn resolve_peer_policy_retain_keeps_last_good_on_unknown_name() {
+        // Regression for the intermittent test_19/test_20 BGP flake:
+        // a reload that re-reads a router.yaml whose `route_maps:` block
+        // hasn't been mirrored to the top level (raw `pkill -HUP bgpd`
+        // racing ecrd's save_config) resolves the peer's named import
+        // policy to nothing. The old code fell back to eBGP deny-all,
+        // dropping every learned route out of Loc-RIB while it sat in the
+        // pre-policy Adj-RIB-In. retain() must instead keep the last-good
+        // policy so the reload is order-insensitive.
+        use std::collections::HashMap;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let peer = IpAddr::V4(Ipv4Addr::new(172, 30, 0, 1));
+        let ebgp_default = crate::policy::Policy::default(); // DenyAll
+        let good = crate::policy::Policy::RouteMap(compile_map(
+            r#"
+name: UPSTREAM-IN
+statements:
+  - seq: 10
+    action: permit
+    match:
+      prefix_list: ["10.99.0.0/24"]
+    set:
+      local_preference: 200
+"#,
+        ));
+
+        // Reload #1: the normalized file has UPSTREAM-IN at the top level.
+        let mut maps: HashMap<String, crate::config::BgpRouteMap> = HashMap::new();
+        maps.insert("UPSTREAM-IN".into(), compile_map(
+            r#"
+name: UPSTREAM-IN
+statements:
+  - seq: 10
+    action: permit
+    match:
+      prefix_list: ["10.99.0.0/24"]
+"#,
+        ));
+        let resolved = resolve_peer_policy_retain(
+            Some("UPSTREAM-IN"), &maps, &ebgp_default, Some(&good), peer, "import",
+        );
+        assert!(
+            matches!(resolved, crate::policy::Policy::RouteMap(_)),
+            "a resolvable name must produce the route-map policy"
+        );
+
+        // Reload #2: un-normalized file — top-level route_maps is empty, so
+        // the name misses. With a prior good policy we must RETAIN it, not
+        // collapse to deny-all.
+        let empty: HashMap<String, crate::config::BgpRouteMap> = HashMap::new();
+        let retained = resolve_peer_policy_retain(
+            Some("UPSTREAM-IN"), &empty, &ebgp_default, Some(&good), peer, "import",
+        );
+        assert!(
+            matches!(retained, crate::policy::Policy::RouteMap(_)),
+            "unknown name with a prior policy must retain last-good, not deny-all"
+        );
+
+        // No prior policy (fresh spawn-style): fall back to the default.
+        let no_prior = resolve_peer_policy_retain(
+            Some("UPSTREAM-IN"), &empty, &ebgp_default, None, peer, "import",
+        );
+        assert!(
+            matches!(no_prior, crate::policy::Policy::DenyAll),
+            "unknown name with no prior must use the RFC 8212 default"
+        );
+
+        // A resolvable keyword (deny-all) still updates even with a prior —
+        // an operator intentionally tightening policy is unaffected.
+        let tightened = resolve_peer_policy_retain(
+            Some("deny-all"), &empty, &ebgp_default, Some(&good), peer, "import",
+        );
+        assert!(
+            matches!(tightened, crate::policy::Policy::DenyAll),
+            "a resolvable name must override the prior policy"
+        );
+
+        // No configured name at all → default (unchanged behaviour).
+        let none = resolve_peer_policy_retain(
+            None, &empty, &ebgp_default, Some(&good), peer, "import",
+        );
+        assert!(matches!(none, crate::policy::Policy::DenyAll));
     }
 
     #[test]
