@@ -40,13 +40,13 @@ use crate::config::{BgpDaemonConfig, BgpPeerConfig};
 use crate::control::{PeerSnapshot, SpeakerSnapshot};
 use crate::loc_rib::LocRib;
 use crate::local_origin::LocalOrigin;
+use crate::packet::attrs::{AsPathSegment, AsPathSegmentType, Origin, PathAttribute};
+use crate::packet::caps::{AFI_IPV6, SAFI_UNICAST};
+use crate::packet::update::{Prefix4, Prefix6, Update};
 use crate::peer::fsm::{PeerFsmConfig, PeerState};
 use crate::peer::transport::TokioTcpTransport;
 use crate::peer::{Peer, PeerConnectInfo, PeerControl, PeerStateUpdate};
 use crate::rib_push;
-use crate::packet::attrs::{AsPathSegment, AsPathSegmentType, Origin, PathAttribute};
-use crate::packet::caps::{AFI_IPV6, SAFI_UNICAST};
-use crate::packet::update::{Prefix4, Prefix6, Update};
 
 const DEFAULT_BGP_PORT: u16 = 179;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -159,13 +159,9 @@ impl BgpInstance {
         rib_socket_path: &str,
         snapshot: Arc<Mutex<SpeakerSnapshot>>,
     ) -> Result<(Self, mpsc::Sender<InstanceControl>)> {
-        let rib = ribd_client::connect_with_retry(
-            rib_socket_path,
-            "bgpd",
-            Duration::from_secs(10),
-        )
-        .await
-        .context("connecting to ribd")?;
+        let rib = ribd_client::connect_with_retry(rib_socket_path, "bgpd", Duration::from_secs(10))
+            .await
+            .context("connecting to ribd")?;
 
         // Seed the snapshot with the speaker's identity so
         // `bgpd query summary` works before any peers come up.
@@ -225,7 +221,11 @@ impl BgpInstance {
         // visible in queries before any peer sends an UPDATE.
         {
             let mut snap = instance.snapshot.lock().await;
-            let loc = rebuild_loc_rib(&snap.peers, &instance.local_pseudo_rib, &instance.peer_policies);
+            let loc = rebuild_loc_rib(
+                &snap.peers,
+                &instance.local_pseudo_rib,
+                &instance.peer_policies,
+            );
             snap.loc_rib = loc;
         }
         Ok((instance, control_tx))
@@ -254,10 +254,7 @@ impl BgpInstance {
     /// Called after `rebuild_local_pseudo_rib` at startup and after
     /// every Loc-RIB rebuild in the event loop.
     fn recompute_aggregates(&mut self) {
-        let local_router_id = self
-            .config
-            .router_id
-            .unwrap_or(Ipv4Addr::UNSPECIFIED);
+        let local_router_id = self.config.router_id.unwrap_or(Ipv4Addr::UNSPECIFIED);
         let local_asn = self.config.local_asn;
 
         for (agg, _summary_only) in &self.parsed_aggregates_v4 {
@@ -303,7 +300,10 @@ impl BgpInstance {
         use crate::packet::caps::{AFI_IPV6, SAFI_UNICAST};
 
         self.local_pseudo_rib = AdjRibIn::new();
-        let local_router_id = self.config.router_id.unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
+        let local_router_id = self
+            .config
+            .router_id
+            .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
 
         for prefix in &self.local_origin.v4 {
             let oc = self
@@ -318,12 +318,8 @@ impl BgpInstance {
                 PathAttribute::NextHop(std::net::Ipv4Addr::UNSPECIFIED),
                 PathAttribute::LocalPref(100),
             ];
-            let route = StoredRoute::local_origin(
-                path_attrs,
-                self.config.local_asn,
-                local_router_id,
-                oc,
-            );
+            let route =
+                StoredRoute::local_origin(path_attrs, self.config.local_asn, local_router_id, oc);
             self.local_pseudo_rib.insert_v4(*prefix, route);
         }
 
@@ -345,12 +341,8 @@ impl BgpInstance {
                     nlri: Vec::new(),
                 },
             ];
-            let route = StoredRoute::local_origin(
-                path_attrs,
-                self.config.local_asn,
-                local_router_id,
-                oc,
-            );
+            let route =
+                StoredRoute::local_origin(path_attrs, self.config.local_asn, local_router_id, oc);
             self.local_pseudo_rib.insert_v6(*prefix, route);
         }
     }
@@ -380,11 +372,7 @@ impl BgpInstance {
         Ok(())
     }
 
-    async fn spawn_one_peer(
-        &mut self,
-        peer_id: PeerId,
-        cfg: &BgpPeerConfig,
-    ) -> Result<()> {
+    async fn spawn_one_peer(&mut self, peer_id: PeerId, cfg: &BgpPeerConfig) -> Result<()> {
         // router-id resolves from peer override first, then daemon
         // global. Either is sufficient — a multi-AS deployment may
         // omit the global and supply a per-peer router-id for
@@ -525,8 +513,7 @@ impl BgpInstance {
 
         // Build a map of peer IP → (PeerId, control sender) for
         // fast lookup on accept.
-        let mut peer_map: HashMap<IpAddr, (PeerId, mpsc::Sender<PeerControl>)> =
-            HashMap::new();
+        let mut peer_map: HashMap<IpAddr, (PeerId, mpsc::Sender<PeerControl>)> = HashMap::new();
         for (&pid, tx) in &self.peer_controls {
             // Find the peer's address from the snapshot (already
             // populated by spawn_peers).
@@ -600,15 +587,63 @@ impl BgpInstance {
         Some(handle)
     }
 
-    /// 3. *(Future)* periodic timers (BGP MED tie-break recompute,
-    ///    interface change polling, etc.). v1 has none.
+    /// True if any configured peer names an `import_policy:` /
+    /// `export_policy:` that does not currently resolve to a keyword or a
+    /// known route-map in `self.config.route_maps`.
+    ///
+    /// This is the boot-race signature. bgpd reads route-maps from the
+    /// *top-level* `route_maps:` block of router.yaml, which ecrd's
+    /// `save_config` populates by mirroring the operator's
+    /// `bgp.route_maps`. If bgpd loads the file before ecrd has done that
+    /// (the boot ordering race), a named `import_policy: UPSTREAM-IN`
+    /// resolves to nothing, the peer falls to the RFC 8212
+    /// `ebgp_default_deny()`, and every route already sitting in the
+    /// pre-policy Adj-RIB-In drops out of Loc-RIB. Unlike the SIGHUP
+    /// reload path (which retains the last-resolved policy), a *boot*
+    /// resolve has no prior to retain, so the deny sticks until some
+    /// later reload happens to read a normalized file — which nothing
+    /// guarantees. The reconcile tick in `run` uses this predicate to
+    /// re-read the config until the names resolve, so the deny self-heals
+    /// without an external SIGHUP nudge.
+    fn any_named_policy_unresolved(&self) -> bool {
+        self.config.peers.iter().any(|p| {
+            [p.import_policy.as_deref(), p.export_policy.as_deref()]
+                .into_iter()
+                .flatten()
+                .any(|n| crate::policy::resolve_policy_name(n, &self.config.route_maps).is_none())
+        })
+    }
+
+    /// 3. Periodic reconcile timer. While any peer's named policy is
+    ///    unresolved (the boot-race above), re-read the config on a fixed
+    ///    cadence so a peer stranded at default-deny recovers once ecrd
+    ///    has normalized router.yaml — no external SIGHUP required. In
+    ///    steady state (all names resolved) the tick is a cheap predicate
+    ///    check and does nothing.
     ///
     /// Returns when the events channel closes (all peers gone),
     /// which should only happen on shutdown.
     pub async fn run(mut self) {
         tracing::info!("BgpInstance entering main loop");
+        // Self-heal cadence for the boot-race default-deny. Mirrors the
+        // ospfd v3 ribd-reconcile tick. 10s keeps recovery well inside the
+        // integration suite's 120s BGP-route convergence window.
+        let mut reconcile_tick = tokio::time::interval(Duration::from_secs(10));
+        reconcile_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
+                _ = reconcile_tick.tick() => {
+                    if self.any_named_policy_unresolved() {
+                        tracing::info!(
+                            "reconcile: a named peer policy is still unresolved \
+                             (router.yaml likely not yet normalized by ecrd); \
+                             re-reading config to recover from boot-race deny"
+                        );
+                        if let Err(e) = self.reload_config().await {
+                            tracing::warn!("reconcile reload failed: {}", e);
+                        }
+                    }
+                }
                 event = self.events_rx.recv() => {
                     let Some((peer_id, event)) = event else {
                         break;
@@ -788,10 +823,7 @@ impl BgpInstance {
     ///
     /// Returns true if anything changed (caller skips the "no
     /// local-origin changes" early-return in reload_config).
-    async fn diff_and_apply_peers(
-        &mut self,
-        new_config: &BgpDaemonConfig,
-    ) -> Result<bool> {
+    async fn diff_and_apply_peers(&mut self, new_config: &BgpDaemonConfig) -> Result<bool> {
         use std::net::IpAddr;
 
         let mut changed = false;
@@ -804,11 +836,8 @@ impl BgpInstance {
             .enumerate()
             .map(|(idx, p)| (p.address, idx as PeerId + 1))
             .collect();
-        let new_by_addr: HashMap<IpAddr, &BgpPeerConfig> = new_config
-            .peers
-            .iter()
-            .map(|p| (p.address, p))
-            .collect();
+        let new_by_addr: HashMap<IpAddr, &BgpPeerConfig> =
+            new_config.peers.iter().map(|p| (p.address, p)).collect();
 
         // Remove peers that are gone from the new config.
         let to_remove: Vec<(PeerId, IpAddr)> = old_by_addr
@@ -922,11 +951,7 @@ impl BgpInstance {
         Ok(changed)
     }
 
-    async fn handle_event(
-        &mut self,
-        peer_id: PeerId,
-        event: PeerStateUpdate,
-    ) -> Result<()> {
+    async fn handle_event(&mut self, peer_id: PeerId, event: PeerStateUpdate) -> Result<()> {
         match event {
             PeerStateUpdate::StateChanged(new_state, negotiated_hold) => {
                 let mut snap = self.snapshot.lock().await;
@@ -941,7 +966,8 @@ impl BgpInstance {
                     if let Some(p) = snap.peers.iter_mut().find(|p| p.id == peer_id) {
                         p.adj_rib_in = AdjRibIn::new();
                     }
-                    let loc = rebuild_loc_rib(&snap.peers, &self.local_pseudo_rib, &self.peer_policies);
+                    let loc =
+                        rebuild_loc_rib(&snap.peers, &self.local_pseudo_rib, &self.peer_policies);
                     snap.loc_rib = loc;
                     drop(snap);
                     self.push_full().await?;
@@ -1013,11 +1039,8 @@ impl BgpInstance {
                 {
                     let mut snap = snap.lock().await;
                     apply_update_to_peer(&mut snap, peer_id, update)?;
-                    let loc = rebuild_loc_rib(
-                        &snap.peers,
-                        &self.local_pseudo_rib,
-                        &self.peer_policies,
-                    );
+                    let loc =
+                        rebuild_loc_rib(&snap.peers, &self.local_pseudo_rib, &self.peer_policies);
                     snap.loc_rib = loc;
                 }
                 self.push_full().await?;
@@ -1107,7 +1130,11 @@ impl BgpInstance {
 
         // Local TCP address feeds next-hop-self.
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        if tx.send(PeerControl::QueryLocalAddr(reply_tx)).await.is_err() {
+        if tx
+            .send(PeerControl::QueryLocalAddr(reply_tx))
+            .await
+            .is_err()
+        {
             tracing::warn!(peer_id, "peer task gone, skipping advertise");
             return None;
         }
@@ -1169,11 +1196,10 @@ impl BgpInstance {
                     continue;
                 }
                 let source = crate::policy::source_for_route(&entry.winner);
-                if !ctx.export_policy.permits_v4(
-                    prefix,
-                    &entry.winner.path_attributes,
-                    source,
-                ) {
+                if !ctx
+                    .export_policy
+                    .permits_v4(prefix, &entry.winner.path_attributes, source)
+                {
                     continue;
                 }
                 if !ctx.redistribute.permits(
@@ -1183,7 +1209,10 @@ impl BgpInstance {
                 ) {
                     continue;
                 }
-                if suppressed_v4.iter().any(|agg| is_more_specific_v4(agg, prefix)) {
+                if suppressed_v4
+                    .iter()
+                    .any(|agg| is_more_specific_v4(agg, prefix))
+                {
                     continue;
                 }
                 should.v4.insert(*prefix);
@@ -1200,11 +1229,10 @@ impl BgpInstance {
                     continue;
                 }
                 let source = crate::policy::source_for_route(&entry.winner);
-                if !ctx.export_policy.permits_v6(
-                    prefix,
-                    &entry.winner.path_attributes,
-                    source,
-                ) {
+                if !ctx
+                    .export_policy
+                    .permits_v6(prefix, &entry.winner.path_attributes, source)
+                {
                     continue;
                 }
                 if !ctx.redistribute.permits(
@@ -1214,7 +1242,10 @@ impl BgpInstance {
                 ) {
                     continue;
                 }
-                if suppressed_v6.iter().any(|agg| is_more_specific_v6(agg, prefix)) {
+                if suppressed_v6
+                    .iter()
+                    .any(|agg| is_more_specific_v6(agg, prefix))
+                {
                     continue;
                 }
                 should.v6.insert(*prefix);
@@ -1275,12 +1306,7 @@ impl BgpInstance {
             for group in groups.v4.into_values() {
                 let representative = &group[0].1;
                 let prefixes: Vec<Prefix4> = group.iter().map(|(p, _)| *p).collect();
-                let attrs = build_outbound_v4_attrs(
-                    representative,
-                    ctx.is_ebgp,
-                    ctx.local_asn,
-                    nh,
-                );
+                let attrs = build_outbound_v4_attrs(representative, ctx.is_ebgp, ctx.local_asn, nh);
                 let update = Update {
                     withdrawn_v4: Vec::new(),
                     path_attributes: attrs,
@@ -1320,7 +1346,6 @@ impl BgpInstance {
             self.advertise_to_peer(pid).await;
         }
     }
-
 }
 
 /// Build an outbound IPv4 UPDATE announcing every prefix in
@@ -1344,8 +1369,14 @@ impl BgpInstance {
 /// Address-family input for [`build_announce`]. Each variant
 /// carries the prefixes to announce and the next-hop to advertise.
 enum AnnounceAfi<'a> {
-    V4 { prefixes: &'a [Prefix4], next_hop: Ipv4Addr },
-    V6 { prefixes: &'a [Prefix6], next_hop: Ipv6Addr },
+    V4 {
+        prefixes: &'a [Prefix4],
+        next_hop: Ipv4Addr,
+    },
+    V6 {
+        prefixes: &'a [Prefix6],
+        next_hop: Ipv6Addr,
+    },
 }
 
 /// Build an outbound UPDATE for a freshly-originated set of
@@ -1447,11 +1478,7 @@ pub fn build_withdraw_v6(prefixes: &[Prefix6]) -> Update {
 /// prefixes are inserted with the message's path attributes.
 /// Both the legacy v4 fields and MP_REACH/UNREACH v6 fields are
 /// honored.
-fn apply_update_to_peer(
-    snap: &mut SpeakerSnapshot,
-    peer_id: PeerId,
-    update: Update,
-) -> Result<()> {
+fn apply_update_to_peer(snap: &mut SpeakerSnapshot, peer_id: PeerId, update: Update) -> Result<()> {
     let peer = snap
         .peers
         .iter_mut()
@@ -1644,10 +1671,7 @@ fn rebuild_loc_rib(
             (p.id, rib)
         })
         .collect();
-    let mut inputs: Vec<(PeerId, &AdjRibIn)> = filtered
-        .iter()
-        .map(|(id, r)| (*id, r))
-        .collect();
+    let mut inputs: Vec<(PeerId, &AdjRibIn)> = filtered.iter().map(|(id, r)| (*id, r)).collect();
     inputs.push((LOCAL_PEER_ID, local));
     LocRib::rebuild(&inputs)
 }
@@ -1656,8 +1680,13 @@ fn rebuild_loc_rib(
 /// NEXT_HOP inline as an attribute; v6 routes ride inside
 /// MP_REACH_NLRI (RFC 4760 §3) which bundles next-hop + NLRI bytes.
 enum OutboundAfi {
-    V4 { next_hop: Ipv4Addr },
-    V6 { next_hop: Ipv6Addr, nlri_bytes: Vec<u8> },
+    V4 {
+        next_hop: Ipv4Addr,
+    },
+    V6 {
+        next_hop: Ipv6Addr,
+        nlri_bytes: Vec<u8>,
+    },
 }
 
 /// Rewrite a Loc-RIB winner's path attributes for outbound
@@ -1714,7 +1743,10 @@ fn build_outbound_attrs(
             out.push(PathAttribute::NextHop(next_hop));
             None
         }
-        OutboundAfi::V6 { next_hop, nlri_bytes } => Some((next_hop, nlri_bytes)),
+        OutboundAfi::V6 {
+            next_hop,
+            nlri_bytes,
+        } => Some((next_hop, nlri_bytes)),
     };
 
     // iBGP-only: LOCAL_PREF (default 100) and MED (preserve if present).
@@ -1754,7 +1786,9 @@ fn build_outbound_v4_attrs(
         winner,
         is_ebgp,
         local_asn,
-        OutboundAfi::V4 { next_hop: local_next_hop },
+        OutboundAfi::V4 {
+            next_hop: local_next_hop,
+        },
     )
 }
 
@@ -1769,7 +1803,10 @@ fn build_outbound_v6_attrs(
         winner,
         is_ebgp,
         local_asn,
-        OutboundAfi::V6 { next_hop: local_next_hop, nlri_bytes },
+        OutboundAfi::V6 {
+            next_hop: local_next_hop,
+            nlri_bytes,
+        },
     )
 }
 
@@ -1917,9 +1954,7 @@ impl RedistributeFilter {
     ) -> bool {
         use ribd_proto::Source;
         let pf = match oc {
-            OriginClass::PeerLearned
-            | OriginClass::Static
-            | OriginClass::Aggregate => return true,
+            OriginClass::PeerLearned | OriginClass::Static | OriginClass::Aggregate => return true,
             OriginClass::Connected => &self.connected,
             OriginClass::Redistribute(Source::Static) => &self.static_,
             OriginClass::Redistribute(
@@ -2165,9 +2200,7 @@ struct OutboundGroups {
 
 /// Parse aggregate-address configs into typed prefixes. Unparseable
 /// entries are logged and skipped.
-fn parse_aggregates_v4(
-    configs: &[crate::config::AggregateConfig],
-) -> Vec<(Prefix4, bool)> {
+fn parse_aggregates_v4(configs: &[crate::config::AggregateConfig]) -> Vec<(Prefix4, bool)> {
     let mut out = Vec::new();
     for c in configs {
         if let Ok(net) = c.prefix.parse::<ipnet::Ipv4Net>() {
@@ -2185,9 +2218,7 @@ fn parse_aggregates_v4(
     out
 }
 
-fn parse_aggregates_v6(
-    configs: &[crate::config::AggregateConfig],
-) -> Vec<(Prefix6, bool)> {
+fn parse_aggregates_v6(configs: &[crate::config::AggregateConfig]) -> Vec<(Prefix6, bool)> {
     let mut out = Vec::new();
     for c in configs {
         if let Ok(net) = c.prefix.parse::<ipnet::Ipv6Net>() {
@@ -2236,9 +2267,7 @@ fn is_more_specific_v6(aggregate: &Prefix6, specific: &Prefix6) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packet::attrs::{
-        AsPathSegment, AsPathSegmentType, Origin, PathAttribute,
-    };
+    use crate::packet::attrs::{AsPathSegment, AsPathSegmentType, Origin, PathAttribute};
     use crate::packet::update::{Prefix4, Update};
     use std::net::Ipv4Addr;
 
@@ -2662,9 +2691,9 @@ statements:
 
         // NEXT_HOP still rewritten to local (unconditional
         // next-hop-self in v1).
-        assert!(attrs
-            .iter()
-            .any(|a| matches!(a, PathAttribute::NextHop(n) if *n == Ipv4Addr::new(192, 0, 2, 254))));
+        assert!(attrs.iter().any(
+            |a| matches!(a, PathAttribute::NextHop(n) if *n == Ipv4Addr::new(192, 0, 2, 254))
+        ));
     }
 
     #[test]
@@ -2866,8 +2895,10 @@ statements:
 
         // Reload #1: the normalized file has UPSTREAM-IN at the top level.
         let mut maps: HashMap<String, crate::config::BgpRouteMap> = HashMap::new();
-        maps.insert("UPSTREAM-IN".into(), compile_map(
-            r#"
+        maps.insert(
+            "UPSTREAM-IN".into(),
+            compile_map(
+                r#"
 name: UPSTREAM-IN
 statements:
   - seq: 10
@@ -2875,9 +2906,15 @@ statements:
     match:
       prefix_list: ["10.99.0.0/24"]
 "#,
-        ));
+            ),
+        );
         let resolved = resolve_peer_policy_retain(
-            Some("UPSTREAM-IN"), &maps, &ebgp_default, Some(&good), peer, "import",
+            Some("UPSTREAM-IN"),
+            &maps,
+            &ebgp_default,
+            Some(&good),
+            peer,
+            "import",
         );
         assert!(
             matches!(resolved, crate::policy::Policy::RouteMap(_)),
@@ -2889,7 +2926,12 @@ statements:
         // collapse to deny-all.
         let empty: HashMap<String, crate::config::BgpRouteMap> = HashMap::new();
         let retained = resolve_peer_policy_retain(
-            Some("UPSTREAM-IN"), &empty, &ebgp_default, Some(&good), peer, "import",
+            Some("UPSTREAM-IN"),
+            &empty,
+            &ebgp_default,
+            Some(&good),
+            peer,
+            "import",
         );
         assert!(
             matches!(retained, crate::policy::Policy::RouteMap(_)),
@@ -2898,7 +2940,12 @@ statements:
 
         // No prior policy (fresh spawn-style): fall back to the default.
         let no_prior = resolve_peer_policy_retain(
-            Some("UPSTREAM-IN"), &empty, &ebgp_default, None, peer, "import",
+            Some("UPSTREAM-IN"),
+            &empty,
+            &ebgp_default,
+            None,
+            peer,
+            "import",
         );
         assert!(
             matches!(no_prior, crate::policy::Policy::DenyAll),
@@ -2908,7 +2955,12 @@ statements:
         // A resolvable keyword (deny-all) still updates even with a prior —
         // an operator intentionally tightening policy is unaffected.
         let tightened = resolve_peer_policy_retain(
-            Some("deny-all"), &empty, &ebgp_default, Some(&good), peer, "import",
+            Some("deny-all"),
+            &empty,
+            &ebgp_default,
+            Some(&good),
+            peer,
+            "import",
         );
         assert!(
             matches!(tightened, crate::policy::Policy::DenyAll),
@@ -2916,9 +2968,8 @@ statements:
         );
 
         // No configured name at all → default (unchanged behaviour).
-        let none = resolve_peer_policy_retain(
-            None, &empty, &ebgp_default, Some(&good), peer, "import",
-        );
+        let none =
+            resolve_peer_policy_retain(None, &empty, &ebgp_default, Some(&good), peer, "import");
         assert!(matches!(none, crate::policy::Policy::DenyAll));
     }
 
@@ -3151,8 +3202,16 @@ statements:
         let old_set = vec![p_a, p_b];
         let new_set = vec![p_b, p_c];
 
-        let added: Vec<Prefix4> = new_set.iter().filter(|p| !old_set.contains(p)).copied().collect();
-        let removed: Vec<Prefix4> = old_set.iter().filter(|p| !new_set.contains(p)).copied().collect();
+        let added: Vec<Prefix4> = new_set
+            .iter()
+            .filter(|p| !old_set.contains(p))
+            .copied()
+            .collect();
+        let removed: Vec<Prefix4> = old_set
+            .iter()
+            .filter(|p| !new_set.contains(p))
+            .copied()
+            .collect();
 
         assert_eq!(added, vec![p_c]);
         assert_eq!(removed, vec![p_a]);
